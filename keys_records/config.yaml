@@ -1,0 +1,33 @@
+pacing:
+  nav_delay_min: 4.0
+  nav_delay_max: 9.0
+  dwell_min: 2.0
+  dwell_max: 5.0
+  key_delay_min: 0.08
+  key_delay_max: 0.22
+  rate_cap_per_minute: 6
+  long_rest_every_min: 8
+  long_rest_every_max: 12
+  long_rest_min: 20.0
+  long_rest_max: 45.0
+
+backoff:
+  initial_seconds: 120
+  multiplier: 2.0
+  max_seconds: 480
+  circuit_break_after: 3
+
+cache:
+  root: ./cache
+  freshness_days: 7
+
+sessions:
+  root: ./sessions
+
+run:
+  parcel_cap: 5
+
+robots:
+  restricted_domains:
+    - schneidercorp.com
+  restricted_pacing_multiplier: 2.0
