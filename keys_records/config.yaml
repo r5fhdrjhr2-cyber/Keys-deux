@@ -27,6 +27,10 @@ sessions:
 run:
   parcel_cap: 5
 
+ceilings:
+  list_price: 1800000
+  hoa_monthly: 2000
+
 robots:
   restricted_domains:
     - schneidercorp.com
