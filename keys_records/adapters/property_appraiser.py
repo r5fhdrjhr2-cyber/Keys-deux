@@ -899,20 +899,22 @@ def fetch_via_qpublic_direct(
     client: PoliteClient,
     cache_root: Path,
     cache_key: str,
+    deep_link: Optional[str] = None,
 ) -> Optional[AppraiserRecord]:
     """
     Navigate to the qPublic direct deep-link for parcel_id and extract the
     full property record card, including multi-year valuation history and
     MCPA permit history.
 
-    Uses the URL pattern:
+    Prefers the authoritative MCPA_URL deep link (from the Monroe County GIS
+    layer) when supplied; otherwise builds the URL from the parcel ID using:
       https://qpublic.schneidercorp.com/Application.aspx
         ?AppID=605&LayerID=9946&PageTypeID=4&PageID=7635&KeyValue={parcel_id}
 
     On any block, CAPTCHA, or challenge page: stops immediately, logs, and
     returns None. Never attempts to solve CAPTCHAs.
     """
-    url = QPUBLIC_DIRECT_TEMPLATE.format(parcel_id=parcel_id)
+    url = deep_link or QPUBLIC_DIRECT_TEMPLATE.format(parcel_id=parcel_id)
 
     # Check cache first (avoids re-hitting the site on repeated runs)
     snap_dir = cache_root / "qpublic_direct"
@@ -1276,72 +1278,94 @@ def fetch(
 
     cache_key = re.sub(r"[^\w\-]", "_", parcel_id or address or "unknown")[:80]
 
-    # ── Stage 1: FDOR Statewide Cadastral (primary identifier) ───────────────
-    cad_record: Optional[AppraiserRecord] = None
+    # ── Stage 1: base record from an OPEN dataset (no Cloudflare, works anywhere)
+    # Monroe County's own GIS parcel layer is richest (2 assessment years, a sale
+    # with OR book/page, legal, centroid, and the authoritative qPublic deep
+    # link). The FDOR Statewide Cadastral is the fallback (current year only).
+    from . import monroe_gis
 
+    base: Optional[AppraiserRecord] = None
     if parcel_id:
         try:
-            cad_record = fetch_via_cadastral(parcel_id, cache_root, cache_key)
-            if cad_record and cad_record.owner_names:
-                logger.info("Cadastral resolved by parcel: owner=%s", cad_record.owner_names)
-            else:
-                logger.info("Cadastral by-parcel returned no data.")
+            base = monroe_gis.fetch_by_parcel(parcel_id, cache_root, cache_key)
         except Exception as exc:
-            logger.warning("Cadastral by-parcel errored: %s", exc)
-
-    if not cad_record and address:
+            logger.warning("Monroe GIS by-parcel errored: %s", exc)
+    if not base and address:
         try:
-            cad_record = fetch_via_cadastral_by_address(address, cache_root, cache_key)
-            if cad_record and cad_record.owner_names:
-                logger.info("Cadastral resolved by address: owner=%s", cad_record.owner_names)
-            else:
-                logger.info("Cadastral by-address returned no data.")
+            base = monroe_gis.fetch_by_address(address, cache_root, cache_key)
         except Exception as exc:
-            logger.warning("Cadastral by-address errored: %s", exc)
+            logger.warning("Monroe GIS by-address errored: %s", exc)
 
-    # Resolve actual parcel ID (supplied arg takes precedence over derived)
-    actual_parcel_id = parcel_id or (
-        cad_record and (cad_record.parcel_id or cad_record.folio)
-    )
+    # FDOR cadastral fallback if the county layer missed.
+    if not base or not base.owner_names:
+        try:
+            cad = (fetch_via_cadastral(parcel_id, cache_root, cache_key) if parcel_id else None)
+            if (not cad or not cad.owner_names) and address:
+                cad = fetch_via_cadastral_by_address(address, cache_root, cache_key)
+            if cad and cad.owner_names:
+                base = cad
+                logger.info("Base appraiser record from FDOR Cadastral (GIS missed).")
+        except Exception as exc:
+            logger.warning("FDOR cadastral fallback errored: %s", exc)
 
-    # ── Stage 2: qPublic direct deep-link (enrichment) ────────────────────────
-    # Requires a parcel ID. Adds multi-year valuations, building detail, MCPA permits.
-    qpub_record: Optional[AppraiserRecord] = None
+    # Resolve the parcel ID and the qPublic deep link from whatever we got.
+    actual_parcel_id = parcel_id or (base and (base.parcel_id or base.folio)) or None
+    mcpa_url = getattr(base, "mcpa_url", None) if base else None
+
+    # ── Stage 2: qPublic deep-link enrichment (full history + permits) ────────
+    # qPublic is the ONLY source for 3+ years of valuation history, full sales
+    # history, and permit history. It is Cloudflare-protected: a real browser on
+    # a workstation reaches it; headless/server environments are blocked. We try
+    # it and degrade gracefully — on a block we keep the open-data base record and
+    # the report flags the gap with the exact deep link (no false "zero permits").
+    qpub: Optional[AppraiserRecord] = None
     if actual_parcel_id:
-        logger.info("Stage 2: qPublic direct deep-link for parcel %s", actual_parcel_id)
-        qpub_record = fetch_via_qpublic_direct(
-            actual_parcel_id, client, cache_root, cache_key
+        qpub = fetch_via_qpublic_direct(
+            actual_parcel_id, client, cache_root, cache_key, deep_link=mcpa_url
         )
 
-    # ── Merge ─────────────────────────────────────────────────────────────────
-    if qpub_record:
-        # qPublic has richer data; use it as primary with cadastral supplementing.
-        # Centroid from cadastral (has geometry; qPublic does not)
-        if cad_record and cad_record.parcel_centroid:
-            qpub_record.parcel_centroid = cad_record.parcel_centroid
-        # Jurisdiction from cadastral (city-to-permit-router) if qPublic didn't resolve
-        if not qpub_record.jurisdiction and cad_record:
-            qpub_record.jurisdiction = cad_record.jurisdiction
-        # Owner names: qPublic is authoritative if it has them; fall back to cadastral
-        if not qpub_record.owner_names and cad_record:
-            qpub_record.owner_names = cad_record.owner_names
-        # Situs address from cadastral if qPublic page omitted it
-        if not qpub_record.situs_address and cad_record:
-            qpub_record.situs_address = cad_record.situs_address
-        # If valuation history is missing from qPublic but present in cadastral, use cadastral
-        if not qpub_record.valuation_history and cad_record:
-            qpub_record.valuation_history = cad_record.valuation_history
+    if qpub:
+        # qPublic is authoritative where present; fill gaps from the open-data base.
+        if base:
+            if base.parcel_centroid:
+                qpub.parcel_centroid = base.parcel_centroid
+            if not qpub.jurisdiction:
+                qpub.jurisdiction = base.jurisdiction
+            if not qpub.owner_names:
+                qpub.owner_names = base.owner_names
+            if not qpub.situs_address:
+                qpub.situs_address = base.situs_address
+            if not qpub.re_number:
+                qpub.re_number = base.re_number
+            if not qpub.valuation_history:
+                qpub.valuation_history = base.valuation_history
+            if not qpub.sales_history:
+                qpub.sales_history = base.sales_history
+        qpub.mcpa_url = mcpa_url or getattr(qpub, "mcpa_url", None)
+        qpub.qpublic_reached = True
+        qpub.valuation_source_note = (
+            f"{len(qpub.valuation_history)} year(s) of valuation and full permit "
+            "history retrieved from qPublic property record card."
+        )
         logger.info(
-            "qPublic merged: val_years=%d, permits=%d, improvements=%d",
-            len(qpub_record.valuation_history),
-            len(qpub_record.mcpa_permits),
-            len(qpub_record.improvements),
+            "Returning qPublic-enriched record: val_years=%d permits=%d",
+            len(qpub.valuation_history), len(qpub.mcpa_permits),
         )
-        return qpub_record
+        return qpub
 
-    if cad_record:
-        logger.info("qPublic direct unavailable; returning FDOR Cadastral record only.")
-        return cad_record
+    if base:
+        n = len(base.valuation_history)
+        base.valuation_source_note = (
+            f"{n} assessment year(s) retrieved from the open Monroe County GIS / FDOR "
+            "roll. Full multi-year history (typically 7 years) and permit history are "
+            "only published on the Cloudflare-protected qPublic property record card, "
+            "which is not reachable from an automated/server run. Open the deep link "
+            "below in a normal browser to retrieve them."
+        )
+        logger.info(
+            "qPublic unreachable; returning open-data base record (%d valuation year(s)).", n
+        )
+        return base
 
-    logger.warning("Both FDOR Cadastral and qPublic returned no data for this parcel/address.")
+    logger.warning("No appraiser data from Monroe GIS, FDOR Cadastral, or qPublic.")
     return None

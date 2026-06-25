@@ -161,6 +161,31 @@ def run(
                 url="https://qpublic.schneidercorp.com/Application.aspx?AppID=605",
             ))
 
+        # qPublic carries the full multi-year valuation history AND the permit
+        # history. It is Cloudflare-protected and unreachable from an automated
+        # server run (reachable from a normal browser on a workstation). When the
+        # appraiser record came from the open GIS/FDOR roll without qPublic
+        # enrichment, flag the gap with the EXACT deep link so the human can pull
+        # the permits and full history in one click — never report "0 permits".
+        if appraiser_record is not None and not getattr(appraiser_record, "qpublic_reached", False):
+            deep_link = (getattr(appraiser_record, "mcpa_url", None)
+                         or "https://qpublic.schneidercorp.com/Application.aspx?AppID=605")
+            n_years = len(appraiser_record.valuation_history or [])
+            manual_retrievals.append(ManualRetrievalRequiredSchema(
+                source="Monroe County Property Appraiser — qPublic property record card (permit history + full valuation history)",
+                reason=(
+                    f"The open county roll provided {n_years} assessment year(s) and a "
+                    "partial sales history, but the FULL multi-year valuation history "
+                    "(typically 7 years) and the PERMIT history live only on the qPublic "
+                    "property record card, which is behind Cloudflare and cannot be "
+                    "retrieved by an automated/server run. This is NOT a confirmation that "
+                    "no permits exist. Open the deep link in a normal browser; the Permits "
+                    "and Historical Assessments tables are on the page."
+                ),
+                contact=deep_link,
+                url=deep_link,
+            ))
+
         # --- Step 3: Tax Collector ---
         tax_record = None
         if not resolved_parcel_id:

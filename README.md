@@ -27,8 +27,9 @@ It makes no network calls except through the retrieval layer.
 
 | Source | System | Jurisdiction |
 |--------|--------|-------------|
-| Property Appraiser (primary) | Florida DOR Statewide Cadastral, ArcGIS REST (JSON over HTTP) | All Monroe County parcels |
-| Property Appraiser (fallback) | qPublic AppID 605 (schneidercorp.com) | All Monroe County parcels |
+| Property Appraiser (primary) | Monroe County GIS "Current Parcels" ArcGIS REST (JSON over HTTP) | All Monroe County parcels |
+| Property Appraiser (fallback) | Florida DOR Statewide Cadastral, ArcGIS REST (JSON over HTTP) | All Monroe County parcels |
+| Property Appraiser (full history + permits) | qPublic AppID 605 (schneidercorp.com) -- Cloudflare-protected, real browser only | All Monroe County parcels |
 | Tax Collector | monroetaxcollector.com, monroecounty-fl.gov | All Monroe County parcels |
 | Clerk -- Official Records | monroe-clerk.com | All Monroe County |
 | Clerk -- Civil Cases | monroe-clerk.com | All Monroe County |
@@ -292,17 +293,39 @@ listed in the unknowns section of every report:
   district.
 
 Monroe County Property Appraiser (mcpafl.org / qPublic) uses Cloudflare
-protection that blocks automated browser sessions. Rather than fight it, the
-tool reads the same property roll (owner, just/assessed/taxable value, year
-built, living area, legal description, land use, lot size, homestead) from the
-Florida Department of Revenue Statewide Cadastral, an open ArcGIS REST service
-that answers plain JSON requests with no browser and no CAPTCHA. It resolves by
-parcel ID, or by street address via a spatial query when no parcel ID is known
-(so `--mls N --address "..."` works even for listings that never expose a tax
-number). The Cloudflare-protected qPublic site is used only as a fallback. The
-tax *collector* bill/payment/delinquency portal remains behind Cloudflare; when
-it cannot be reached the tool emits a manual-retrieval notice (the assessed and
-taxable *values* still come from the cadastral above).
+protection that blocks automated access from any server environment: plain HTTP
+gets a 403 challenge, and even a real headless browser has its connection
+dropped at the egress layer. Rather than fight it, the tool reads the property
+roll from two open ArcGIS REST services that answer plain JSON with no browser
+and no CAPTCHA:
+
+1. **Monroe County GIS "Current Parcels"** (the county's own ArcGIS Online org)
+   is the primary source. It carries owner, mailing/situs address, legal
+   description, subdivision, millage group, year built, living area, lot area,
+   the most recent qualified sale (price + OR book/page), the parcel centroid,
+   **two assessment years** of valuation (land, building, just, assessed,
+   taxable, exempt), and the exact qPublic property-record-card deep link.
+2. **Florida DOR Statewide Cadastral** is the fallback (current year only),
+   resolvable by parcel ID or by street address via a spatial query.
+
+So `--mls N` alone works: the address is discovered from the listing and the
+parcel is resolved from these open services.
+
+What the open services do **not** carry — and what therefore lives only on the
+Cloudflare-protected qPublic property record card — is the **full multi-year
+valuation history** (typically 7 years) and the **permit history**. When run
+from a workstation with a real browser, the tool follows the qPublic deep link
+and scrapes the Permits and Historical Assessments tables directly. When run
+from a server/headless environment where qPublic is unreachable, the tool does
+**not** invent a "0 permits" result: it reports the two verified valuation years
+from the open roll and emits a manual-retrieval to-do containing the exact
+parcel deep link and step-by-step instructions to pull the permits and full
+history by hand. An empty automated permit pull is never reported as a confirmed
+absence.
+
+The tax *collector* bill/payment/delinquency portal is likewise behind
+Cloudflare; when it cannot be reached the tool emits a manual-retrieval notice
+(the assessed and taxable *values* still come from the GIS/cadastral roll above).
 
 ---
 

@@ -84,6 +84,9 @@ class AppraiserRecord:
     sales_history: list = field(default_factory=list)
     permit_cross_refs: list = field(default_factory=list)
     mcpa_permits: list = field(default_factory=list)  # permits from qPublic property record
+    mcpa_url: Optional[str] = None  # qPublic property-record-card deep link
+    valuation_source_note: Optional[str] = None  # e.g. "2 years from Monroe GIS; full history on qPublic"
+    qpublic_reached: bool = False  # True only if the qPublic card was actually parsed
     trim_estimate: Optional[float] = None
     parcel_centroid: Optional[dict] = None  # {"lat": float, "lon": float}
     provenance: Optional[Provenance] = None

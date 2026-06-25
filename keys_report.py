@@ -379,8 +379,20 @@ def _section_valuation_tax(doc, pr):
     if certs:
         _warn_para(doc, f"Tax certificates sold: {len(certs)} certificate(s) recorded.")
 
+    # Surface where the valuation years came from and how to get the full history.
+    note = _g(appraiser, "valuation_source_note")
+    if note:
+        doc.add_paragraph(note)
+    mcpa_url = _g(appraiser, "mcpa_url")
+    if mcpa_url and not _g(appraiser, "qpublic_reached"):
+        doc.add_paragraph(
+            "Full multi-year valuation history (≈7 years) is on the qPublic property "
+            f"record card: {mcpa_url}"
+        )
+
     _source_note(doc,
-                 "Monroe County Property Appraiser (qPublic); "
+                 "Monroe County GIS / FDOR roll (valuation years); "
+                 "qPublic property record card (full history, manual); "
                  "Monroe County Tax Collector")
     doc.add_paragraph()
 
@@ -661,6 +673,36 @@ def _section_sources_reached(doc, pr, verdict):
 
 
 _MANUAL_TODO_WORKFLOWS = {
+    "qpublic": {
+        "title": "qPublic Property Record Card — Permit History + Full Valuation History",
+        "url": "https://qpublic.schneidercorp.com/Application.aspx?AppID=605",
+        "steps": [
+            "Open the deep link above in a normal web browser (Chrome/Safari/Firefox). "
+            "It goes straight to this parcel's property record card.",
+            "If a one-time disclaimer appears, click 'Agree' / 'I Accept'.",
+            "Scroll to the 'Permits' table — record every permit: Number, Date "
+            "Issued, Status, Amount, Permit Type, and Notes. Flag any that are NOT "
+            "'Completed'/'Finaled' (open or expired permits = possible unpermitted work).",
+            "Scroll to 'Historical Assessments' — this lists ~7 years of Land, "
+            "Building, Just (Market), Assessed, Exempt and Taxable values. Record at "
+            "least the last 3 years to see the valuation trend and tax trajectory.",
+            "Scroll to 'Sales' for the full deed history (the automated run captured "
+            "only the most recent qualified sale).",
+            "Note: this page is Cloudflare-protected and cannot be retrieved by an "
+            "automated/server process — it must be opened by a human in a browser. "
+            "An empty automated permit result is NOT a confirmation that no permits exist.",
+        ],
+    },
+    "monroe-clerk": {
+        "title": "Monroe County Clerk — Official Records (liens, mortgages, lis pendens)",
+        "url": "https://or.monroe-clerk.com/",
+        "steps": [
+            "Open https://or.monroe-clerk.com/ (Official Records search).",
+            "Search by grantor/grantee name for each owner on this report.",
+            "Look for open mortgages, liens, lis pendens, judgments, and "
+            "non-conversion agreements.",
+        ],
+    },
     "tax": {
         "title": "Tax Collector — Bill, Payment History, Delinquency",
         "url": "https://www.monroecounty-fl.gov/1210/Tax-Collector",
@@ -821,7 +863,9 @@ def _section_manual_todo(doc, pr):
             doc.add_paragraph(reason[:300])
 
         if workflow:
-            url = workflow["url"] or contact_url
+            # Prefer the item's own URL (often a parcel-specific deep link) over
+            # the generic workflow template URL.
+            url = contact_url or workflow["url"]
             if url:
                 doc.add_paragraph(f"URL: {url}")
             doc.add_paragraph("Steps:")
