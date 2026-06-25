@@ -13,7 +13,7 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 
-from ...polite_client import PoliteClient
+from ...polite_client import PoliteClient, ManualRetrievalRequired
 from ...schemas import PermitRecord, Provenance
 
 logger = logging.getLogger("adapter.permits.key_west")
@@ -188,7 +188,17 @@ def fetch(
         for permit in permits:
             _get_detail(client, page, permit, cache_root)
 
+    except ManualRetrievalRequired:
+        raise
     except Exception as exc:
         logger.error("key_west.fetch failed: %s", exc, exc_info=True)
+        raise ManualRetrievalRequired(
+            source=SOURCE_NAME,
+            reason=(f"Automated retrieval failed ({type(exc).__name__}): the "
+                    "permit system could not be reached or parsed this run. This "
+                    "is NOT a confirmed absence of permits — retrieve manually."),
+            contact=BASE_URL,
+            url=BASE_URL,
+        )
 
     return permits

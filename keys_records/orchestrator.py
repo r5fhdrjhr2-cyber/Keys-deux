@@ -182,6 +182,12 @@ def run(
                     parcel_id=resolved_parcel_id,
                     cache_root=cache_root,
                 )
+            except ManualRetrievalRequired as exc:
+                logger.warning("Tax collector manual retrieval: %s", exc.reason)
+                manual_retrievals.append(ManualRetrievalRequiredSchema(
+                    source=exc.source, reason=exc.reason,
+                    contact=exc.contact, url=exc.url,
+                ))
             except Exception as exc:
                 logger.error("Tax collector failed: %s", exc)
                 run_errors.append({
@@ -201,6 +207,12 @@ def run(
                 parcel_id=resolved_parcel_id or "",
                 cache_root=cache_root,
             )
+        except ManualRetrievalRequired as exc:
+            logger.warning("Clerk official manual retrieval: %s", exc.reason)
+            manual_retrievals.append(ManualRetrievalRequiredSchema(
+                source=exc.source, reason=exc.reason,
+                contact=exc.contact, url=exc.url,
+            ))
         except Exception as exc:
             logger.error("Clerk official failed: %s", exc)
             run_errors.append({
@@ -220,6 +232,12 @@ def run(
                 address=situs_address,
                 cache_root=cache_root,
             )
+        except ManualRetrievalRequired as exc:
+            logger.warning("Clerk civil manual retrieval: %s", exc.reason)
+            manual_retrievals.append(ManualRetrievalRequiredSchema(
+                source=exc.source, reason=exc.reason,
+                contact=exc.contact, url=exc.url,
+            ))
         except Exception as exc:
             logger.error("Clerk civil failed: %s", exc)
             run_errors.append({
@@ -283,8 +301,16 @@ def run(
         flood_record = None
         try:
             from .adapters.flood import fetch as fetch_flood, geocode
-            logger.info("Step 7: Geocoding address and fetching flood data")
-            lat, lon = _geocode_address(situs_address, cache_root)
+            logger.info("Step 7: Locating parcel and fetching flood data")
+            # Prefer the appraiser parcel centroid (exact location, no geocode
+            # round-trip or street-match ambiguity); fall back to geocoding.
+            lat = lon = None
+            if appraiser_record and getattr(appraiser_record, "parcel_centroid", None):
+                c = appraiser_record.parcel_centroid
+                lat, lon = c.get("lat"), c.get("lon")
+                logger.info("Using appraiser parcel centroid for flood: %s, %s", lat, lon)
+            if not lat or not lon:
+                lat, lon = _geocode_address(situs_address, cache_root)
             if lat and lon:
                 year_built = None
                 if appraiser_record and appraiser_record.improvements:

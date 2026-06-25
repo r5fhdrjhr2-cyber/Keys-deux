@@ -497,10 +497,11 @@ def _d26_distress(official_records: list, court_cases: list,
     if not searched and not (official_records or court_cases):
         return _diag("2.6", "Distress signals", UNKNOWN,
                      "unknown, not in any source we pull — the name-based Clerk search "
-                     "could not run because no owner name was resolved (appraiser "
-                     "unreachable). This is NOT a confirmed absence of liens, lis "
-                     "pendens, or judgments. Resolve the owner name (via --parcel or "
-                     "manual appraiser lookup) to run this check.", fields)
+                     "did not complete (either no owner name was resolved, or the Clerk "
+                     "index could not be reached this run; see Manual Retrieval Required). "
+                     "This is NOT a confirmed absence of liens, lis pendens, or judgments. "
+                     "Run the Clerk Official Records and civil searches by owner name to "
+                     "complete this check.", fields)
 
     distress_tags = {
         "lis_pendens", "lien", "construction_lien", "claim_of_lien",
@@ -543,7 +544,7 @@ def _d26_distress(official_records: list, court_cases: list,
     return _diag("2.6", "Distress signals", sev, finding, fields, {"flags": flags})
 
 
-def _d27_open_permits(appraiser: Any, permits: list) -> dict:
+def _d27_open_permits(appraiser: Any, permits: list, searched: bool = True) -> dict:
     """2.7 Open or expired permits and unpermitted work."""
     fields = [
         "permits[*].status", "permits[*].finaled_date",
@@ -553,6 +554,17 @@ def _d27_open_permits(appraiser: Any, permits: list) -> dict:
     if permits is None:
         return _diag("2.7", "Open or expired permits and unpermitted work", UNKNOWN,
                      "unknown, not in any source we pull — permit records not returned.",
+                     fields)
+
+    # An empty permit list only means "no open permits" if the permit system was
+    # actually reached. If it flagged a manual retrieval (unreachable/blocked),
+    # an empty result is unknown, not a clean bill of permit health.
+    if not permits and not searched:
+        return _diag("2.7", "Open or expired permits and unpermitted work", UNKNOWN,
+                     "unknown — the permit system could not be reached this run "
+                     "(see Manual Retrieval Required). This is NOT confirmation "
+                     "that all work was permitted or that no permits are open. "
+                     "Retrieve permit history directly from the jurisdiction.",
                      fields)
 
     open_permits = []
@@ -632,10 +644,12 @@ def _d28_non_conversion(official_records: list, searched: bool = True) -> dict:
     if not searched and not official_records:
         return _diag("2.8", "Recorded non-conversion agreement", UNKNOWN,
                      "unknown, not in any source we pull — the Official Records search "
-                     "could not run (no owner name resolved; appraiser unreachable). A "
-                     "non-conversion agreement restricts ground-floor space to storage "
+                     "did not complete (either no owner name was resolved, or the Clerk "
+                     "index could not be reached this run; see Manual Retrieval Required). "
+                     "A non-conversion agreement restricts ground-floor space to storage "
                      "or parking, so this gap directly affects usable square footage. "
-                     "Resolve the owner name to run this check.", fields)
+                     "Complete the Official Records search by owner name to resolve it.",
+                     fields)
 
     found = []
     for rec in official_records:
@@ -873,10 +887,26 @@ def run_diagnostics(listing: dict, parcel_record: Any, config: dict) -> list:
         jurisdiction_hint = _g(parcel_record, "jurisdiction")
 
     # The Clerk's Official Records and civil dockets are searched by owner name.
-    # If no owner name was resolved (appraiser unreachable), that search never
-    # ran, so an empty result must read as unknown, not "none found".
+    # An empty result is only meaningful if the search BOTH had an owner name to
+    # query AND actually reached the Clerk. If no owner name was resolved, or the
+    # Clerk adapter logged a manual-retrieval (unreachable/blocked), the search
+    # never truly ran, so an empty result must read as unknown, not "none found".
     owner_names = _g(parcel_record, "owner_names") or [] if parcel_record else []
-    clerk_searched = bool(owner_names)
+    manual_retrievals = _g(parcel_record, "manual_retrievals_required") or [] if parcel_record else []
+
+    def _source_failed(*needles: str) -> bool:
+        for m in manual_retrievals:
+            src = (m.get("source") if isinstance(m, dict) else getattr(m, "source", "")) or ""
+            if any(n in src.lower() for n in needles):
+                return True
+        return False
+
+    clerk_failed = _source_failed("clerk")
+    clerk_searched = bool(owner_names) and not clerk_failed
+    # Permits were only meaningfully searched if no permit system flagged a
+    # manual retrieval (unreachable/blocked/captcha).
+    permits_searched = not _source_failed("opal", "mcesearch", "viewpoint", "etrakit",
+                                          "cityview", "permit", "key colony", "layton")
 
     # Derive a jurisdiction hint from the listing/address when the appraiser
     # (the usual source) is unreachable, so STR routing isn't a blank.
@@ -892,7 +922,7 @@ def run_diagnostics(listing: dict, parcel_record: Any, config: dict) -> list:
         _d24_mangrove(),
         _d25_tax_shock(appraiser, tax_collector),
         _d26_distress(official_records, court_cases, clerk_searched),
-        _d27_open_permits(appraiser, permits),
+        _d27_open_permits(appraiser, permits, permits_searched),
         _d28_non_conversion(official_records, clerk_searched),
         _d29_special_assessments(tax_collector),
         _d210_roof_age(permits, listing),

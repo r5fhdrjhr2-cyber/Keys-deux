@@ -14,7 +14,7 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 
-from ..polite_client import PoliteClient
+from ..polite_client import PoliteClient, ManualRetrievalRequired
 from ..schemas import Provenance, TaxCollectorRecord, TaxYear
 
 logger = logging.getLogger("adapter.tax_collector")
@@ -244,4 +244,21 @@ def fetch(
     # Fallback
     logger.info("Primary tax collector URL failed, trying fallback")
     record = _try_search(client, FALLBACK_URL, parcel_id, cache_root)
-    return record
+    if record:
+        return record
+
+    # Both endpoints failed. The tax-collector portal (TaxSys / county-taxes.com)
+    # is frequently behind a Cloudflare challenge that we will not attempt to
+    # solve. Surface this as a manual-retrieval gap rather than a silent empty so
+    # the report never reads it as "taxes are current / no delinquency".
+    raise ManualRetrievalRequired(
+        source=SOURCE_NAME,
+        reason=("Tax-collector bill, payment status, and delinquency could not "
+                "be retrieved (the portal is commonly behind a Cloudflare "
+                "challenge, which this tool does not bypass). This is NOT a "
+                "confirmed 'taxes current' — verify the bill and any "
+                "delinquency/certificates manually. Assessed and taxable values "
+                "are available separately from the property appraiser."),
+        contact=FALLBACK_URL,
+        url=PRIMARY_URL,
+    )

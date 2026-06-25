@@ -391,6 +391,13 @@ def _section_permits(doc, pr):
     parcel_id = _g(pr, "parcel_id")
     jurisdiction = _g(pr, "jurisdiction")
 
+    permit_manual = [
+        m for m in manual
+        if any(k in ((_g(m, "source") or "").lower())
+               for k in ("opal", "mcesearch", "viewpoint", "etrakit", "cityview",
+                         "permit", "key colony", "layton"))
+    ]
+
     if not permits:
         if not parcel_id:
             doc.add_paragraph(
@@ -398,6 +405,14 @@ def _section_permits(doc, pr):
                 "search could not run reliably (the county states parcel search is "
                 "more complete than address). This is not a confirmed absence of "
                 "permits. Supply --parcel to enable the search."
+            )
+        elif permit_manual:
+            doc.add_paragraph(
+                f"Unknown. The permit system for jurisdiction "
+                f"'{jurisdiction or 'unknown'}' could not be reached this run (see "
+                "the manual-retrieval notice below). This is NOT a confirmed "
+                "absence of permits and NOT confirmation that all work was "
+                "permitted — retrieve permit history directly from the jurisdiction."
             )
         else:
             doc.add_paragraph(
@@ -450,6 +465,15 @@ def _section_permits(doc, pr):
     doc.add_paragraph()
 
 
+def _clerk_unreached(pr) -> bool:
+    """True if a Clerk source flagged a manual retrieval (could not be reached)."""
+    for m in (_g(pr, "manual_retrievals_required") or []):
+        src = (_g(m, "source") or "").lower()
+        if "clerk" in src:
+            return True
+    return False
+
+
 def _section_official_records(doc, pr):
     doc.add_heading("Recorded Instruments (Official Records)", level=2)
     recs = _g(pr, "official_records") or []
@@ -463,6 +487,14 @@ def _section_official_records(doc, pr):
                 "run. This is not a confirmed absence of liens, mortgages, or "
                 "non-conversion agreements. Resolve the owner name (via --parcel or "
                 "manual appraiser lookup) to enable this search."
+            )
+        elif _clerk_unreached(pr):
+            doc.add_paragraph(
+                "Unknown. The Clerk Official Records index could not be reached this "
+                f"run for owner name(s) {', '.join(owners)} (see the manual-retrieval "
+                "notice in Sources Reached). This is NOT a confirmed absence of "
+                "liens, mortgages, or non-conversion agreements — search the Clerk "
+                "Official Records directly by owner name."
             )
         else:
             doc.add_paragraph(
@@ -515,6 +547,13 @@ def _section_court_cases(doc, pr):
                 "unreachable), so the name-based civil and foreclosure docket search "
                 "could not run. This is not a confirmed absence of litigation or "
                 "foreclosure. Resolve the owner name to enable this search."
+            )
+        elif _clerk_unreached(pr):
+            doc.add_paragraph(
+                "Unknown. The Clerk civil/foreclosure docket could not be reached this "
+                f"run for owner name(s) {', '.join(owners)} (see the manual-retrieval "
+                "notice in Sources Reached). This is NOT a confirmed absence of "
+                "litigation or foreclosure — search the Clerk civil docket directly."
             )
         else:
             doc.add_paragraph(
@@ -579,12 +618,29 @@ def _section_sources_reached(doc, pr, verdict):
     manual = _g(pr, "manual_retrievals_required") or []
     errors = _g(pr, "run_errors") or []
 
+    # Which sources flagged a manual retrieval (could not be reached/parsed)?
+    # An unreached source must NOT read as "0 found" — that is a false all-clear.
+    manual_src = " ".join(
+        ((_g(m, "source") or "") if not isinstance(m, str) else m).lower()
+        for m in manual
+    )
+    clerk_unreached = "clerk" in manual_src
+    permits_unreached = any(k in manual_src for k in (
+        "opal", "mcesearch", "viewpoint", "etrakit", "cityview", "permit",
+        "key colony", "layton"))
+
+    def _count_or_unreached(items, noun, unreached):
+        n = len(items or [])
+        if n == 0 and unreached:
+            return f"not retrieved this run — manual retrieval required (NOT a confirmed zero {noun})"
+        return f"{n} {noun}(s)"
+
     status_lines = [
         f"Property Appraiser: {'returned data' if appraiser else 'no data returned'}",
-        f"Tax Collector: {'returned data' if tax_col else 'no data returned'}",
-        f"Clerk Official Records: {len(off_recs or [])} instrument(s)",
-        f"Clerk Civil Cases: {len(court or [])} case(s)",
-        f"Permits: {len(permits or [])} permit(s) across all systems",
+        f"Tax Collector: {'returned data' if tax_col else 'not retrieved — manual retrieval required' if 'tax' in manual_src else 'no data returned'}",
+        f"Clerk Official Records: {_count_or_unreached(off_recs, 'instrument', clerk_unreached)}",
+        f"Clerk Civil Cases: {_count_or_unreached(court, 'case', clerk_unreached)}",
+        f"Permits: {_count_or_unreached(permits, 'permit', permits_unreached)} across all systems",
         f"Flood (FEMA NFHL): {'returned data' if flood else 'no data returned'}",
     ]
     for line in status_lines:

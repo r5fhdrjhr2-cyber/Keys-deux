@@ -97,23 +97,105 @@ def _cache_write(path: Path, content: str) -> None:
 
 # ---------------------------------------------------------------------------
 # robots.txt gating
+#
+# We do NOT use urllib.robotparser: it mis-handles real-world robots.txt files
+# that contain many user-agent groups carrying only Crawl-delay (no Allow/
+# Disallow) — it collapses to "disallow everything", which both defeats the
+# tool and misrepresents the site's actual policy. This is a correct, minimal
+# implementation of the standard matching algorithm: pick the group for our UA
+# (falling back to '*'), then apply longest-match Allow/Disallow rules.
 # ---------------------------------------------------------------------------
 
-_robots: dict[str, urllib.robotparser.RobotFileParser] = {}
+_robots: dict[str, dict] = {}  # origin -> {"groups": [...], "ok": bool}
+
+
+def _parse_robots(text: str) -> list[dict]:
+    """Parse robots.txt into [{'agents': [...], 'rules': [(allow_bool, path)]}]."""
+    groups: list[dict] = []
+    current: dict | None = None
+    last_was_agent = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        field, _, value = line.partition(":")
+        field = field.strip().lower()
+        value = value.strip()
+        if field == "user-agent":
+            if current is None or not last_was_agent:
+                current = {"agents": [], "rules": []}
+                groups.append(current)
+            current["agents"].append(value.lower())
+            last_was_agent = True
+        elif field in ("allow", "disallow") and current is not None:
+            current["rules"].append((field == "allow", value))
+            last_was_agent = False
+        else:
+            last_was_agent = False
+    return groups
+
+
+def _robots_rules_for(groups: list[dict], ua: str) -> list[tuple]:
+    """Return the rule list for the most specific matching UA group, or '*'."""
+    ua_low = ua.lower()
+    specific = None
+    star = None
+    for g in groups:
+        for agent in g["agents"]:
+            if agent == "*":
+                star = g
+            elif agent and agent in ua_low:
+                specific = g
+    chosen = specific or star
+    return chosen["rules"] if chosen else []
 
 
 def _robots_allowed(url: str) -> bool:
     parsed = urllib.parse.urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     if origin not in _robots:
-        rp = urllib.robotparser.RobotFileParser()
+        rules = []
         try:
-            rp.set_url(f"{origin}/robots.txt")
-            rp.read()
+            resp = _http().get(f"{origin}/robots.txt", timeout=SESSION_TIMEOUT)
+            if resp.status_code == 200 and resp.text:
+                rules = _robots_rules_for(_parse_robots(resp.text), BROWSER_UA)
         except Exception:
-            rp = urllib.robotparser.RobotFileParser()
-        _robots[origin] = rp
-    return _robots[origin].can_fetch(BROWSER_UA, url)
+            rules = []  # robots unreachable -> default allow (standard behavior)
+        _robots[origin] = {"rules": rules}
+
+    rules = _robots[origin]["rules"]
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    # Longest-match wins; Allow beats Disallow on equal length (RFC 9309).
+    best_len = -1
+    best_allow = True
+    for allow, pattern in rules:
+        if pattern == "":
+            # An empty Disallow means "allow all"; empty Allow is a no-op.
+            continue
+        # Translate the limited robots wildcard syntax to a prefix/glob check.
+        if _robots_path_match(pattern, path):
+            if len(pattern) > best_len or (len(pattern) == best_len and allow):
+                best_len = len(pattern)
+                best_allow = allow
+    return best_allow
+
+
+def _robots_path_match(pattern: str, path: str) -> bool:
+    """Match a robots path pattern (supports * wildcard and $ anchor)."""
+    end_anchor = pattern.endswith("$")
+    pat = pattern[:-1] if end_anchor else pattern
+    if "*" not in pat:
+        if end_anchor:
+            return path == pat or path.startswith(pat) and len(path) == len(pat)
+        return path.startswith(pat)
+    # Wildcard match: build a regex from the pattern.
+    regex = "^" + ".*".join(re.escape(seg) for seg in pat.split("*")) + ("$" if end_anchor else "")
+    try:
+        return re.search(regex, path) is not None
+    except re.error:
+        return path.startswith(pat.split("*")[0])
 
 
 # ---------------------------------------------------------------------------
@@ -357,15 +439,102 @@ def _is_scrape_tolerant(url: str) -> bool:
     return True
 
 
+def _slugify_address(address: str) -> str:
+    """Turn '6501 Oceanview Ave, Marathon, FL 33050' into a URL slug."""
+    s = re.sub(r",", " ", address)
+    s = re.sub(r"\bFL\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"[^A-Za-z0-9 ]", " ", s)
+    return "-".join(s.split())
+
+
+_LKR_FULL_MARKER = "pdp-property-info-list-item-heading"
+_LKR_PRICE_MARKER = "mls-property-widget-info-pricing-price"
+
+
+def _lkr_is_full(html: str) -> bool:
+    """Full detail page (has the labeled property-info section), not just price."""
+    return _LKR_FULL_MARKER in html
+
+
+def fetch_lastkeyrealty_direct(mls_number: str, address: str | None) -> dict | None:
+    """
+    Fetch the Last Key Realty server-rendered detail page directly, no search key.
+
+    Last Key Realty server-renders its own listings, but only the *exact*
+    canonical address slug renders the full labeled detail section; a near-miss
+    slug (e.g. "Ave" vs the canonical "Avenue") renders only the price header.
+    So we:
+      1. fetch a slug built from the address (or a generic token),
+      2. if that page is only partial, harvest the real listing-slug links the
+         page itself contains and follow the one that renders full detail.
+    Returns the best page found (full > partial), or None for IDX-only listings
+    (JS shell, no server-rendered price), which defer to search / the browser.
+    """
+    cache_key = "page_lastkeyrealty.com"
+    first_slug = _slugify_address(address) if address else "property"
+    if not first_slug:
+        first_slug = "property"
+
+    base = "https://www.lastkeyrealty.com"
+    seen_slugs: set[str] = set()
+    best: dict | None = None
+
+    def _try(slug: str) -> dict | None:
+        nonlocal best
+        if slug in seen_slugs:
+            return None
+        seen_slugs.add(slug)
+        url = f"{base}/mls/{mls_number}/{slug}"
+        # Distinct cache key per slug so a partial page can't shadow the full one.
+        html = _fetch(url, mls_number, f"{cache_key}_{slug[:40]}")
+        if not html or _LKR_PRICE_MARKER not in html:
+            return None
+        page = {"url": url, "html": html, "retrieved_at": _now_iso()}
+        if _lkr_is_full(html):
+            return page
+        if best is None:
+            best = page  # remember partial as fallback
+        return None
+
+    page = _try(first_slug)
+    if page:
+        log.info("lastkeyrealty direct: full detail page for MLS %s", mls_number)
+        return page
+
+    # Harvest the canonical listing-slug links the (partial) page exposes and
+    # follow them to find the full-detail rendering. Cap extra fetches at 3.
+    if best is not None:
+        candidates = re.findall(rf"/mls/{mls_number}/([A-Za-z0-9\-]+)", best["html"])
+        for slug in list(dict.fromkeys(candidates))[:3]:
+            page = _try(slug)
+            if page:
+                log.info("lastkeyrealty direct: full detail via harvested slug for MLS %s", mls_number)
+                return page
+
+    if best is not None:
+        log.info("lastkeyrealty direct: only partial (price-only) page for MLS %s", mls_number)
+        return best
+
+    log.info("lastkeyrealty direct: JS shell / not a Last Key listing for MLS %s", mls_number)
+    return None
+
+
 def fetch_listing_pages(mls_number: str, search_results: list[dict]) -> list[dict]:
     """
     Fetch scrape-tolerant listing pages from search results.
     Returns list of {url, html, retrieved_at}.
+
+    lastkeyrealty.com results are pulled to the front so the authoritative
+    Keys listing-of-record is always parsed (and wins reconciliation) even when
+    a generic aggregator ranks higher in search.
     """
     fetched = []
     seen_urls: set[str] = set()
 
-    for result in search_results:
+    def _rank(result: dict) -> int:
+        return 0 if "lastkeyrealty.com" in (result.get("link", "")) else 1
+
+    for result in sorted(search_results, key=_rank):
         url = result.get("link", "")
         if not url or url in seen_urls:
             continue
@@ -861,12 +1030,140 @@ def parse_dom(html: str) -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Site-specific structured parser: lastkeyrealty.com
+#
+# Last Key Realty is a Florida Keys brokerage whose IDX detail pages are the
+# authoritative listing-of-record for Keys MLS numbers. Their server-rendered
+# pages put every field in its own labeled DOM element, so we read the price
+# from the dedicated price element and each fact from its own "Label: Value"
+# container. This is immune to the failure modes that plagued the generic DOM
+# parser (grabbing a mortgage-calculator $25k, an NFIP $10M reference, or a
+# photo-URL number; or bleeding one field's value into the next). Verified
+# field-by-field against the listing PDF for MLS 619378.
+# ---------------------------------------------------------------------------
+
+# Map normalized label text -> (our field name, converter)
+def _lkr_acres_to_sqft(s: str):
+    m = re.search(r"[\d.]+", s)
+    return int(round(float(m.group(0)) * 43560)) if m else None
+
+
+_LKR_LABEL_FIELDS = {
+    "sqft": ("living_area_sqft", lambda s: _int_or_none(re.sub(r"[^\d]", "", s))),
+    "acres": ("lot_size_sqft", _lkr_acres_to_sqft),
+    "subdivision": ("subdivision", str.strip),
+    "days on market": ("days_on_market", lambda s: _int_or_none(re.sub(r"[^\d]", "", s))),
+    "tax number": ("parcel_id", str.strip),
+    "property type": ("property_type", str.strip),
+    "water/sewer": ("water_sewer", str.strip),
+    "year built": ("year_built", lambda s: _int_or_none(re.sub(r"[^\d]", "", s)[:4])),
+    "waterfront features": ("waterfront", str.strip),
+    "roof": ("roof", str.strip),
+    "address": ("_addr_full", str.strip),
+}
+
+
+def parse_lastkeyrealty(html: str) -> dict:
+    """Structure-aware parser for a lastkeyrealty.com listing detail page."""
+    soup = BeautifulSoup(html, "lxml")
+    result: dict = {}
+
+    # Price: the dedicated price element. Never a calculator/NFIP/photo number.
+    pe = soup.select_one(".mls-property-widget-info-pricing-price")
+    if pe:
+        m = re.search(r"\$\s?([\d,]+)", pe.get_text(" ", strip=True))
+        if m:
+            val = _int_or_none(m.group(1).replace(",", ""))
+            if val:
+                result["list_price"] = val
+
+    # Beds / baths: dedicated label divs ("Bedroom 2 bedrooms").
+    for lab in soup.select(".mls-property-widget-info-label"):
+        ltext = lab.get_text(" ", strip=True)
+        m = re.search(r"(\d+(?:\.\d+)?)", ltext)
+        if not m:
+            continue
+        val = _float_or_none(m.group(1))
+        if val is None:
+            continue
+        if re.search(r"bath", ltext, re.IGNORECASE):
+            result.setdefault("baths", val)
+        elif re.search(r"bed", ltext, re.IGNORECASE):
+            result.setdefault("beds", val)
+
+    # Status / property class (e.g. "Residential").
+    se = soup.select_one(".mls-property-widget-info-subheading-type")
+    if se:
+        result["status"] = se.get_text(strip=True)
+
+    # Labeled facts: each label sits in its own container as "Label: Value".
+    containers = [h.parent for h in soup.select(".pdp-property-info-list-item-heading")]
+    containers += [st.parent for st in soup.find_all("strong")]
+    for container in containers:
+        if container is None:
+            continue
+        txt = container.get_text(" ", strip=True)
+        if ":" not in txt:
+            continue
+        label, _, value = txt.partition(":")
+        label = label.strip().lower()
+        value = value.strip()
+        if label in _LKR_LABEL_FIELDS and value:
+            field, conv = _LKR_LABEL_FIELDS[label]
+            try:
+                converted = conv(value)
+            except Exception:
+                converted = None
+            if converted not in (None, ""):
+                result.setdefault(field, converted)
+
+    # Normalize address into the record's address dict.
+    full = result.pop("_addr_full", None)
+    if full:
+        parts = [p.strip() for p in full.split(",")]
+        street = parts[0] if parts else full
+        city = parts[1] if len(parts) > 1 else ""
+        state_ = "FL"
+        zipc = ""
+        if len(parts) > 2:
+            sz = parts[2].split()
+            state_ = sz[0] if sz else "FL"
+            zipc = sz[1] if len(sz) > 1 else ""
+        result["address"] = {
+            "full": full, "street": street, "city": city,
+            "state": state_, "zip": zipc,
+        }
+
+    # Public remarks from the agent comments / meta description.
+    meta_desc = soup.find("meta", attrs={"name": "description"})
+    if meta_desc and meta_desc.get("content"):
+        result.setdefault("public_remarks", meta_desc["content"])
+
+    return result
+
+
+def _host_of(url: str) -> str:
+    try:
+        return urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
+    except Exception:
+        return ""
+
+
 def parse_page(page: dict) -> tuple[dict, str]:
     """
-    Parse a fetched page using JSON-LD → embedded state → DOM fallback.
+    Parse a fetched page. Site-specific parser for lastkeyrealty.com first,
+    then JSON-LD → embedded state → generic DOM fallback.
     Returns (fields_dict, method_used).
     """
     html = page["html"]
+    host = _host_of(page.get("url", ""))
+
+    # 0. Authoritative site-specific parser (Keys listing-of-record).
+    if host.endswith("lastkeyrealty.com"):
+        fields = parse_lastkeyrealty(html)
+        if fields.get("list_price") or fields.get("parcel_id"):
+            return fields, "lastkeyrealty"
 
     # 1. JSON-LD
     blocks = extract_json_ld(html)
@@ -1251,50 +1548,65 @@ _NUMERIC_FIELDS = {
 }
 
 
+# Source priority for reconciliation, best first. "lastkeyrealty" is the
+# authoritative Keys listing-of-record and outranks generic page parses, so a
+# random aggregator can never overwrite its price (the $300k / $10M bug).
+_SOURCE_PRIORITY = [
+    "reso", "mcpa", "lastkeyrealty", "json-ld", "embedded-state", "dom", "snippet",
+]
+
+
+def _source_rank(tag: str) -> int:
+    base = tag.split(":", 1)[0]  # tolerate "dom:host" style tags
+    try:
+        return _SOURCE_PRIORITY.index(base)
+    except ValueError:
+        return len(_SOURCE_PRIORITY)
+
+
 def reconcile(sources: list[tuple[str, dict]]) -> tuple[dict, list[dict]]:
     """
-    Merge fields from multiple (source_name, fields) tuples.
+    Merge fields from multiple (source_tag, fields) tuples.
     Returns (merged_record, conflicts_list).
-    Priority: reso > mcpa (physical facts) > most-recently-added listing source.
+
+    Priority order is _SOURCE_PRIORITY (reso > mcpa > lastkeyrealty > json-ld >
+    embedded-state > dom > snippet). For each field the highest-priority source
+    that supplies a usable value wins; ties break on original order. Critically,
+    sources are NOT collapsed by parse method, so a second generic page can no
+    longer silently overwrite the authoritative source's value.
     """
     merged: dict = {}
-    all_values: dict[str, dict[str, Any]] = {}  # field -> {source: value}
+    # field -> list of (rank, order_index, source_tag, value)
+    all_values: dict[str, list] = {}
 
-    priority_order = ["reso", "mcpa", "json-ld", "embedded-state", "dom", "snippet"]
-
-    for source_name, fields in sources:
+    for order_index, (source_tag, fields) in enumerate(sources):
+        rank = _source_rank(source_tag)
         for field, value in fields.items():
             if value is None or value == "" or value == []:
                 continue
-            all_values.setdefault(field, {})[source_name] = value
+            all_values.setdefault(field, []).append(
+                (rank, order_index, source_tag, value)
+            )
 
-    for field, by_source in all_values.items():
-        if not by_source:
+    for field, entries in all_values.items():
+        if not entries:
             continue
-        # Pick by priority
-        chosen = None
-        for prio in priority_order:
-            if prio in by_source:
-                chosen = by_source[prio]
-                break
-        if chosen is None:
-            # Take the first available
-            chosen = next(iter(by_source.values()))
-        merged[field] = chosen
+        # Lowest rank (highest priority), then earliest order, wins.
+        entries.sort(key=lambda e: (e[0], e[1]))
+        merged[field] = entries[0][3]
 
-    # Detect conflicts
+    # Detect conflicts across distinct contributing sources.
     conflicts = []
-    for field, by_source in all_values.items():
+    for field, entries in all_values.items():
+        by_source = {tag: val for _, _, tag, val in entries}
         if len(by_source) < 2:
             continue
         values_list = list(by_source.values())
-        # For numeric fields compare with 5% tolerance
         if field in _NUMERIC_FIELDS:
             nums = [v for v in values_list if isinstance(v, (int, float))]
             if nums and (max(nums) - min(nums)) / max(max(nums), 1) > 0.05:
                 conflicts.append({"field": field, "values_by_source": by_source})
         else:
-            # String fields: conflict if not all equal (case-insensitive for strings)
             strs = [str(v).lower().strip() for v in values_list if v]
             if len(set(strs)) > 1:
                 conflicts.append({"field": field, "values_by_source": by_source})
@@ -1514,6 +1826,15 @@ def resolve(mls_number: str, address_hint: str | None = None) -> dict:
     # ------------------------------------------------------------------
     # Tier 2 — Web search + page fetch
     # ------------------------------------------------------------------
+    # Tier 2a: try the authoritative Last Key Realty page directly (no search
+    # key required). For its own listings this server-renders the full detail
+    # page, giving us a reliable, correctly-priced source before we even touch
+    # web search. It returns None for IDX-only listings (JS shell).
+    pages: list[dict] = []
+    direct = fetch_lastkeyrealty_direct(mls_number, address_hint)
+    if direct:
+        pages.append(direct)
+
     search_results = search_listings(mls_number)
 
     if search_results:
@@ -1533,38 +1854,45 @@ def resolve(mls_number: str, address_hint: str | None = None) -> dict:
                     log.info("Address extracted from snippet: %s", address_hint)
                     break
 
-        pages = fetch_listing_pages(mls_number, search_results)
-        for page in pages:
-            fields, method = parse_page(page)
-            if fields:
-                source_name = f"{method}:{urllib.parse.urlparse(page['url']).netloc}"
-                raw_sources.append((method, fields))
-                source_meta.append({
-                    "source_name": source_name,
-                    "url": page["url"],
-                    "fields_contributed": list(fields.keys()),
-                    "retrieved_at": page["retrieved_at"],
-                })
-                log.info("Tier 2 %s (%s): %d fields", page["url"], method, len(fields))
+        # Avoid re-fetching the lastkeyrealty page if the direct hit already got it.
+        already = {p["url"] for p in pages}
+        for page in fetch_listing_pages(mls_number, search_results):
+            if page["url"] not in already:
+                pages.append(page)
 
-                # Grab address from first successful page parse if still missing
-                if not address_hint and fields.get("address", {}).get("full"):
-                    address_hint = fields["address"]["full"]
+    for page in pages:
+        fields, method = parse_page(page)
+        if fields:
+            source_name = f"{method}:{urllib.parse.urlparse(page['url']).netloc}"
+            raw_sources.append((method, fields))
+            source_meta.append({
+                "source_name": source_name,
+                "url": page["url"],
+                "fields_contributed": list(fields.keys()),
+                "retrieved_at": page["retrieved_at"],
+            })
+            log.info("Tier 2 %s (%s): %d fields", page["url"], method, len(fields))
 
-        # Tier 3 snippet fallback if no pages or no fields
-        if not any(fields for _, fields in raw_sources if _ != "reso"):
-            log.info("Tier 3: falling back to snippet extraction")
-            snippet_fields = parse_snippets(search_results)
-            if snippet_fields:
-                raw_sources.append(("snippet", snippet_fields))
-                source_meta.append({
-                    "source_name": "search-snippets",
-                    "url": "",
-                    "fields_contributed": list(snippet_fields.keys()),
-                    "retrieved_at": _now_iso(),
-                })
-    else:
-        log.info("Tier 2: no search results (SEARCH_API_KEY not set or no results)")
+            # Grab address from first successful page parse if still missing
+            if not address_hint and fields.get("address", {}).get("full"):
+                address_hint = fields["address"]["full"]
+
+    # Tier 3 snippet fallback only if no page yielded listing fields.
+    listing_fields_found = any(tag != "reso" and f for tag, f in raw_sources)
+    if not listing_fields_found and search_results:
+        log.info("Tier 3: falling back to snippet extraction")
+        snippet_fields = parse_snippets(search_results)
+        if snippet_fields:
+            raw_sources.append(("snippet", snippet_fields))
+            source_meta.append({
+                "source_name": "search-snippets",
+                "url": "",
+                "fields_contributed": list(snippet_fields.keys()),
+                "retrieved_at": _now_iso(),
+            })
+    if not pages and not search_results:
+        log.info("Tier 2: no listing page found (no direct SSR hit; "
+                 "SEARCH_API_KEY not set or no results)")
 
     # ------------------------------------------------------------------
     # Reconcile listing sources

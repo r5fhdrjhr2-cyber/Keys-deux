@@ -14,7 +14,7 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 
-from ...polite_client import PoliteClient
+from ...polite_client import PoliteClient, ManualRetrievalRequired
 from ...schemas import PermitRecord, Provenance
 
 logger = logging.getLogger("adapter.permits.marathon")
@@ -166,7 +166,17 @@ def fetch(
         permits = _parse_permit_list(soup, page.url)
         logger.info("Marathon ViewPointCloud found %d permits for %s", len(permits), search_term)
 
+    except ManualRetrievalRequired:
+        raise
     except Exception as exc:
         logger.error("marathon.fetch failed: %s", exc, exc_info=True)
+        raise ManualRetrievalRequired(
+            source=SOURCE_NAME,
+            reason=(f"Automated retrieval failed ({type(exc).__name__}): the "
+                    "permit system could not be reached or parsed this run. This "
+                    "is NOT a confirmed absence of permits — retrieve manually."),
+            contact=BASE_URL,
+            url=BASE_URL,
+        )
 
     return permits

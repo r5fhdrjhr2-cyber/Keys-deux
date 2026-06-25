@@ -13,7 +13,7 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 
-from ..polite_client import PoliteClient
+from ..polite_client import PoliteClient, ManualRetrievalRequired
 from ..schemas import OfficialRecordInstrument, Provenance
 
 logger = logging.getLogger("adapter.clerk_official")
@@ -253,7 +253,18 @@ def fetch(
                     seen_keys.add(key)
                     all_instruments.append(inst)
 
+    except ManualRetrievalRequired:
+        raise
     except Exception as exc:
         logger.error("clerk_official.fetch failed: %s", exc, exc_info=True)
+        raise ManualRetrievalRequired(
+            source=SOURCE_NAME,
+            reason=(f"Automated retrieval failed ({type(exc).__name__}): the "
+                    "Clerk official-records index could not be reached or parsed "
+                    "this run. This is NOT a confirmed absence of liens, "
+                    "mortgages, or other recorded instruments — search manually."),
+            contact=CLERK_URL,
+            url=CLERK_URL,
+        )
 
     return all_instruments

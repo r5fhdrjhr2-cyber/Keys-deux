@@ -82,6 +82,32 @@ WebGLRenderingContext.prototype.getParameter = function(p) {
 # Per-domain state
 # ---------------------------------------------------------------------------
 
+def _find_chromium_executable() -> Optional[str]:
+    """
+    Locate an installed Chromium under PLAYWRIGHT_BROWSERS_PATH.
+
+    Playwright's bundled launch expects one exact build revision; managed
+    environments often ship a different revision at a fixed path. When the
+    default launch can't find its pinned build, we fall back to whatever
+    chromium build is actually present so retrieval still runs.
+    """
+    root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    if not root or not os.path.isdir(root):
+        return None
+    candidates = []
+    for entry in sorted(os.listdir(root)):
+        if not entry.startswith("chromium"):
+            continue
+        for rel in ("chrome-linux/chrome", "chrome-linux/headless_shell",
+                    "chrome-mac/Chromium.app/Contents/MacOS/Chromium"):
+            exe = os.path.join(root, entry, rel)
+            if os.path.exists(exe):
+                candidates.append(exe)
+    # Prefer a full chrome build over a headless shell.
+    candidates.sort(key=lambda p: ("headless_shell" in p, p))
+    return candidates[0] if candidates else None
+
+
 @dataclass
 class DomainState:
     request_times: deque = field(default_factory=lambda: deque(maxlen=60))
@@ -160,6 +186,14 @@ class PoliteClient:
         self._playwright = sync_playwright().start()
 
         headless_fallback = True
+        # Build a launch-kwargs helper so the executable_path fallback applies
+        # to every launch attempt below.
+        exe = _find_chromium_executable()
+
+        def _launch(**kw):
+            if exe:
+                kw.setdefault("executable_path", exe)
+            return self._playwright.chromium.launch(**kw)
 
         if shutil.which("Xvfb") is not None:
             try:
@@ -170,7 +204,7 @@ class PoliteClient:
                 )
                 os.environ["DISPLAY"] = ":99"
                 time.sleep(0.5)
-                self._browser = self._playwright.chromium.launch(
+                self._browser = _launch(
                     headless=False,
                     args=["--no-sandbox", "--disable-dev-shm-usage"],
                 )
@@ -183,11 +217,12 @@ class PoliteClient:
                     self._xvfb_proc = None
 
         if headless_fallback:
-            self._browser = self._playwright.chromium.launch(
+            self._browser = _launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"],
             )
-            logger.info("Launched headless Chromium (no Xvfb found)")
+            logger.info("Launched headless Chromium%s",
+                        f" ({exe})" if exe else " (no Xvfb found)")
 
         # Read the actual User-Agent from a temp context
         tmp_ctx = self._browser.new_context(

@@ -13,7 +13,7 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 
-from ..polite_client import PoliteClient
+from ..polite_client import PoliteClient, ManualRetrievalRequired
 from ..schemas import CourtCase, Provenance
 
 logger = logging.getLogger("adapter.clerk_civil")
@@ -220,7 +220,18 @@ def fetch(
                     seen_case_numbers.add(case.case_number)
                     all_cases.append(case)
 
+    except ManualRetrievalRequired:
+        raise
     except Exception as exc:
         logger.error("clerk_civil.fetch failed: %s", exc, exc_info=True)
+        raise ManualRetrievalRequired(
+            source=SOURCE_NAME,
+            reason=(f"Automated retrieval failed ({type(exc).__name__}): the "
+                    "Clerk civil/foreclosure docket could not be reached or "
+                    "parsed this run. This is NOT a confirmed absence of "
+                    "litigation or foreclosure — search manually."),
+            contact=CLERK_URL,
+            url=CLERK_URL,
+        )
 
     return all_cases
