@@ -2,13 +2,15 @@
 """
 keys_dd.py -- Florida Keys property due-diligence tool.
 
-Given an MLS number or street address, this tool resolves the Monroe County
-parcel, pulls raw public records from every applicable Keys government system,
-analyzes the data, and writes a Word report plus a JSON verdict file.
+Given an MLS number, this tool resolves the Monroe County parcel, pulls raw
+public records from every applicable Keys government system, analyzes the data,
+and writes a Word report plus a JSON verdict file.  Address is resolved
+automatically from the listing -- you only need the MLS number.
 
 Usage:
-    python keys_dd.py --address "6501 Oceanview Ave, Marathon, FL 33050"
     python keys_dd.py --mls 619378
+    python keys_dd.py --address "6501 Oceanview Ave, Marathon, FL 33050"
+    python keys_dd.py --mls 619378 --address "6501 Oceanview Ave, Marathon, FL 33050"
     python keys_dd.py --validate
     python keys_dd.py --help
 
@@ -292,10 +294,14 @@ def _cli():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            '  python keys_dd.py --mls 619378\n'
+            "  python keys_dd.py --mls 619378\n"
+            "  python keys_dd.py --mls 612427\n"
             '  python keys_dd.py --address "6501 Oceanview Ave, Marathon, FL 33050"\n'
-            '  python keys_dd.py --mls 612427 --address "1113 De Lussan Lane, Cudjoe Key, FL 33042"\n'
             "  python keys_dd.py --validate\n"
+            "\n"
+            "The address is resolved automatically from the listing when --mls is\n"
+            "provided.  Supply --address only if MLS lookup cannot find the listing\n"
+            "or you want to force a specific address string.\n"
         ),
     )
     parser.add_argument("--mls", metavar="NUMBER",

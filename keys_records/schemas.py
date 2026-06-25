@@ -83,6 +83,7 @@ class AppraiserRecord:
     valuation_history: list = field(default_factory=list)
     sales_history: list = field(default_factory=list)
     permit_cross_refs: list = field(default_factory=list)
+    mcpa_permits: list = field(default_factory=list)  # permits from qPublic property record
     trim_estimate: Optional[float] = None
     parcel_centroid: Optional[dict] = None  # {"lat": float, "lon": float}
     provenance: Optional[Provenance] = None

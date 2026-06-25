@@ -136,9 +136,16 @@ def _search_name(client: PoliteClient, page, name: str, cache_root: Path) -> lis
         name_inputs = [
             page.locator("input[name*='grantor' i]"),
             page.locator("input[name*='grantee' i]"),
+            page.locator("input[name*='party' i]"),
             page.locator("input[name*='name' i]"),
+            page.locator("input[id*='grantor' i]"),
+            page.locator("input[id*='grantee' i]"),
+            page.locator("input[id*='party' i]"),
             page.locator("input[id*='name' i]"),
             page.locator("input[placeholder*='name' i]"),
+            page.locator("input[placeholder*='grantor' i]"),
+            page.locator("input[placeholder*='party' i]"),
+            page.locator("input[type='text']").first,
         ]
         name_input = None
         for loc in name_inputs:
@@ -150,8 +157,10 @@ def _search_name(client: PoliteClient, page, name: str, cache_root: Path) -> lis
                 pass
 
         if name_input is None:
-            logger.warning("Could not find name input on clerk official records page")
-            return results
+            raise Exception(
+                "Could not find name/grantor/grantee input on clerk official records page. "
+                "The page structure may have changed or the site did not load correctly."
+            )
 
         name_input.clear()
         client.type_text(name_input, name)

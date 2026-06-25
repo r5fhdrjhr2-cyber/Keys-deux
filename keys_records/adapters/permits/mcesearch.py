@@ -132,6 +132,8 @@ def fetch(
     client: PoliteClient,
     parcel_id: str,
     cache_root: Path,
+    address: Optional[str] = None,
+    **_kwargs,
 ) -> list:
     """Fetch permit records from MCeSearch for a parcel ID."""
     cached_html = client.load_snapshot("mcesearch", parcel_id)

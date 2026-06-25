@@ -26,6 +26,7 @@ from ..polite_client import PoliteClient
 from ..schemas import (
     AppraiserRecord,
     ImprovementDetail,
+    PermitRecord,
     Provenance,
     SalesRecord,
     ValuationYear,
@@ -35,6 +36,14 @@ logger = logging.getLogger("adapter.property_appraiser")
 
 BASE_URL = "https://qpublic.schneidercorp.com/Application.aspx?AppID=605"
 SOURCE_NAME = "Monroe County Property Appraiser (qPublic)"
+
+# Direct deep-link bypasses the search form. Format with parcel_id.
+# Pattern confirmed from user ground-truth PDF for parcel 00341780-000000.
+QPUBLIC_DIRECT_TEMPLATE = (
+    "https://qpublic.schneidercorp.com/Application.aspx"
+    "?AppID=605&LayerID=9946&PageTypeID=4&PageID=7635&KeyValue={parcel_id}"
+)
+QPUBLIC_SOURCE = "Monroe County Property Appraiser (qPublic, direct property record)"
 
 # ---------------------------------------------------------------------------
 # Primary path: Florida DOR Statewide Cadastral (ArcGIS REST, JSON over HTTP).
@@ -482,6 +491,478 @@ def fetch_via_cadastral_by_address(
     )
 
 
+# ---------------------------------------------------------------------------
+# qPublic direct deep-link scraper
+# ---------------------------------------------------------------------------
+
+def _find_col(col_map: dict, cells: list, *keys: str) -> Optional[str]:
+    """Return the first matching cell value for any key substring in col_map."""
+    for k in keys:
+        k_up = k.upper()
+        for col, idx in col_map.items():
+            if k_up in col and idx < len(cells):
+                return cells[idx]
+    return None
+
+
+def _qpub_money(s: Optional[str]) -> Optional[int]:
+    """Parse '$763,425' or '763425' to int, return None on failure."""
+    if not s:
+        return None
+    cleaned = re.sub(r"[^0-9]", "", s)
+    return int(cleaned) if cleaned else None
+
+
+def _section_heading_table(soup: BeautifulSoup, *keywords: str) -> Optional[BeautifulSoup]:
+    """Find the first <table> that follows a heading containing any keyword."""
+    kw_up = [k.upper() for k in keywords]
+    for h in soup.find_all(["h2", "h3", "h4", "h5", "strong"]):
+        title = h.get_text(strip=True).upper()
+        if any(kw in title for kw in kw_up):
+            tbl = h.find_next("table")
+            if tbl:
+                return tbl
+    return None
+
+
+def _parse_qpublic_owners(soup: BeautifulSoup) -> list:
+    """Extract owner names from the Owner section of a qPublic page."""
+    owners = []
+    for h in soup.find_all(["h2", "h3", "h4", "h5"]):
+        if h.get_text(strip=True).upper() in ("OWNER", "OWNER(S)", "OWNERS"):
+            # Collect text from siblings until next heading
+            for sib in h.next_siblings:
+                if sib.name and re.match(r"^h[2-5]$", sib.name):
+                    break
+                if not hasattr(sib, "get_text"):
+                    continue
+                for line in sib.get_text(separator="\n").split("\n"):
+                    name = line.strip()
+                    if (name and len(name) >= 3
+                            and not re.match(r"^\d", name)
+                            and name.upper() not in ("OWNER", "FL", "N/A", "NONE")):
+                        owners.append(name)
+            break
+    # De-dup address lines (contain city/state/zip patterns)
+    cleaned = []
+    for n in owners:
+        if re.search(r"\bFL\s+\d{5}\b", n):
+            continue
+        if re.search(r"^\d+\s+\w", n):  # street number address lines
+            continue
+        cleaned.append(n)
+    return cleaned
+
+
+def _parse_qpublic_historical(soup: BeautifulSoup) -> list:
+    """Parse Historical Assessments table → list of ValuationYear."""
+    valuation_history = []
+    tbl = _section_heading_table(soup, "Historical Assessments")
+    if not tbl:
+        # Fallback: table with Year + Land Value + Just + Assessed headers
+        for t in soup.find_all("table"):
+            hdrs = [th.get_text(strip=True).upper() for th in t.find_all("th")]
+            hdr_str = " ".join(hdrs)
+            if "YEAR" in hdrs and "LAND VALUE" in hdr_str and "ASSESSED VALUE" in hdr_str:
+                tbl = t
+                break
+    if not tbl:
+        return valuation_history
+
+    hdrs_raw = [th.get_text(strip=True) for th in tbl.find_all("th")]
+    col_map = {h.upper(): i for i, h in enumerate(hdrs_raw)}
+
+    for row in tbl.find_all("tr")[1:]:
+        cells = [td.get_text(separator=" ", strip=True) for td in row.find_all("td")]
+        if not cells:
+            continue
+        yr_raw = _find_col(col_map, cells, "YEAR") or (cells[0] if cells else None)
+        yr = _parse_int(yr_raw)
+        if not yr or yr < 1990 or yr > 2035:
+            continue
+        exempt_raw = _find_col(col_map, cells, "EXEMPT VALUE", "EXEMPT")
+        valuation_history.append(ValuationYear(
+            year=yr,
+            just_value=_qpub_money(_find_col(col_map, cells, "JUST (MARKET)", "JUST")),
+            assessed_value=_qpub_money(_find_col(col_map, cells, "ASSESSED VALUE")),
+            taxable_value=_qpub_money(_find_col(col_map, cells, "TAXABLE VALUE")),
+            school_taxable=None,
+            land_value=_qpub_money(_find_col(col_map, cells, "LAND VALUE")),
+            building_value=_qpub_money(_find_col(col_map, cells, "BUILDING VALUE")),
+            homestead_exemption=bool(_qpub_money(exempt_raw)),
+            homestead_amount=_qpub_money(exempt_raw),
+            soh_cap_differential=None,
+        ))
+
+    return valuation_history
+
+
+def _parse_qpublic_land(soup: BeautifulSoup) -> dict:
+    """Parse the Land section → {'lot_sqft': int|None, 'land_use': str|None, ...}."""
+    result = {"lot_sqft": None, "land_use": None, "frontage": None, "depth": None}
+    tbl = _section_heading_table(soup, "Land")
+    if not tbl:
+        for t in soup.find_all("table"):
+            hdr_str = " ".join(th.get_text(strip=True).upper() for th in t.find_all("th"))
+            if "LAND USE" in hdr_str or ("FRONTAGE" in hdr_str and "DEPTH" in hdr_str):
+                tbl = t
+                break
+    if not tbl:
+        return result
+
+    hdrs_raw = [th.get_text(strip=True) for th in tbl.find_all("th")]
+    col_map = {h.upper(): i for i, h in enumerate(hdrs_raw)}
+    for row in tbl.find_all("tr")[1:]:
+        cells = [td.get_text(separator=" ", strip=True) for td in row.find_all("td")]
+        if not cells:
+            continue
+        result["land_use"] = _find_col(col_map, cells, "LAND USE") or result["land_use"]
+        result["frontage"] = _parse_int(_find_col(col_map, cells, "FRONTAGE")) or result["frontage"]
+        result["depth"] = _parse_int(_find_col(col_map, cells, "DEPTH")) or result["depth"]
+        # Number of units + "Square Foot" unit type → lot sqft
+        units_raw = _find_col(col_map, cells, "NUMBER OF UNITS", "UNITS")
+        unit_type = _find_col(col_map, cells, "UNIT TYPE", "TYPE")
+        if units_raw and unit_type and "SQUARE" in unit_type.upper():
+            result["lot_sqft"] = _parse_int(units_raw.replace(",", ""))
+
+    # Fallback: frontage × depth
+    if not result["lot_sqft"] and result["frontage"] and result["depth"]:
+        result["lot_sqft"] = result["frontage"] * result["depth"]
+
+    return result
+
+
+def _parse_qpublic_buildings(soup: BeautifulSoup) -> list:
+    """Parse the Buildings section → list of ImprovementDetail."""
+    improvements = []
+    tbl = _section_heading_table(soup, "Buildings")
+    if not tbl:
+        return improvements
+
+    # qPublic buildings tables use label-value pairs. Common layouts:
+    # 2-col (label | value) or 4-col (label | val | label | val) side by side.
+    labeled: dict = {}
+    for row in tbl.find_all("tr"):
+        cells = [td.get_text(separator=" ", strip=True) for td in row.find_all("td")]
+        if not cells:
+            continue
+        if len(cells) == 2:
+            k = cells[0].rstrip(":").strip().upper()
+            if k and len(k) < 50:
+                labeled[k] = cells[1]
+        elif len(cells) >= 4:
+            for i in range(0, len(cells) - 1, 2):
+                k = cells[i].rstrip(":").strip().upper()
+                if k and len(k) < 50:
+                    labeled[k] = cells[i + 1] if i + 1 < len(cells) else ""
+
+    if not labeled:
+        return improvements
+
+    def _lget(*keys):
+        for k in keys:
+            if k in labeled and labeled[k]:
+                return labeled[k]
+        return None
+
+    eff_yr_raw = (_lget("EFFECTIVEYEARBUILT", "EFFECTIVE YEAR BUILT", "EFF YEAR", "EFF YR BUILT")
+                  or "")
+    stories_raw = _lget("STORIES") or ""
+    stories_val = None
+    m_st = re.search(r"(\d+(?:\.\d)?)", stories_raw)
+    if m_st:
+        try:
+            stories_val = float(m_st.group(1))
+        except ValueError:
+            pass
+
+    beds_raw = _lget("BEDROOMS", "BEDS") or ""
+    baths_raw = _lget("FULL BATHROOMS", "FULL BATHS", "BATHROOMS") or ""
+
+    improvements.append(ImprovementDetail(
+        description=str(_lget("BUILDING TYPE", "STYLE") or "Building"),
+        year_built=_parse_year(_lget("YEAR BUILT")),
+        effective_year=_parse_year(eff_yr_raw) if eff_yr_raw else None,
+        living_area=_parse_int(_lget("FINISHED SQ FT", "FINISHED AREA", "LIVING AREA")),
+        gross_area=_parse_int(_lget("GROSS SQ FT", "GROSS AREA")),
+        stories=stories_val,
+        construction_type=_lget("EXTERIOR WALLS"),
+        roof_type=_lget("ROOF COVERAGE", "ROOF TYPE"),
+        beds=float(beds_raw) if re.match(r"^\d", beds_raw) else None,
+        baths=float(baths_raw) if re.match(r"^\d", baths_raw) else None,
+        assessed_value=None,
+    ))
+    return improvements
+
+
+def _parse_qpublic_sales(soup: BeautifulSoup) -> list:
+    """Parse the Sales table → list of SalesRecord."""
+    sales: list = []
+    tbl = _section_heading_table(soup, "Sales")
+    if not tbl:
+        for t in soup.find_all("table"):
+            hdr_str = " ".join(th.get_text(strip=True).upper() for th in t.find_all("th"))
+            if "SALE DATE" in hdr_str and "SALE PRICE" in hdr_str:
+                tbl = t
+                break
+    if not tbl:
+        return sales
+
+    hdrs_raw = [th.get_text(strip=True) for th in tbl.find_all("th")]
+    col_map = {h.upper(): i for i, h in enumerate(hdrs_raw)}
+
+    for row in tbl.find_all("tr")[1:]:
+        cells = [td.get_text(separator=" ", strip=True) for td in row.find_all("td")]
+        if not cells or not any(cells):
+            continue
+        price_raw = _find_col(col_map, cells, "SALE PRICE", "PRICE")
+        instr_num = _find_col(col_map, cells, "INSTRUMENT NUMBER")
+        instr_type = _find_col(col_map, cells, "INSTRUMENT")
+        # Avoid using the full "INSTRUMENT NUMBER" column as deed_type
+        deed_type = instr_type if (instr_type and not instr_num) else _find_col(col_map, cells, "DEED TYPE")
+        sales.append(SalesRecord(
+            date=_find_col(col_map, cells, "SALE DATE", "DATE"),
+            price=_qpub_money(price_raw),
+            or_book=_find_col(col_map, cells, "DEED BOOK", "OR BOOK", "BOOK"),
+            or_page=_find_col(col_map, cells, "DEED PAGE", "OR PAGE", "PAGE"),
+            instrument_number=instr_num,
+            grantor=_find_col(col_map, cells, "GRANTOR"),
+            grantee=_find_col(col_map, cells, "GRANTEE"),
+            sale_qualification=_find_col(col_map, cells, "SALE QUALIFICATION", "QUALIFICATION", "QUAL"),
+            deed_type=deed_type,
+        ))
+    return sales
+
+
+def _parse_qpublic_permits(
+    soup: BeautifulSoup,
+    page_url: str,
+    cache_path: str,
+) -> list:
+    """Parse the Permits table → list of PermitRecord."""
+    permits: list = []
+    tbl = _section_heading_table(soup, "Permits")
+    if not tbl:
+        for t in soup.find_all("table"):
+            hdr_str = " ".join(th.get_text(strip=True).upper() for th in t.find_all("th"))
+            if "DATE ISSUED" in hdr_str and "STATUS" in hdr_str:
+                tbl = t
+                break
+    if not tbl:
+        return permits
+
+    hdrs_raw = [th.get_text(strip=True) for th in tbl.find_all("th")]
+    col_map = {h.upper(): i for i, h in enumerate(hdrs_raw)}
+    now = datetime.now(timezone.utc).isoformat()
+
+    for row in tbl.find_all("tr")[1:]:
+        cells = [td.get_text(separator=" ", strip=True) for td in row.find_all("td")]
+        if not cells or not any(cells):
+            continue
+        pnum = _find_col(col_map, cells, "NUMBER", "PERMIT NUMBER", "PERMIT #") or cells[0] or "UNKNOWN"
+        amount_raw = _find_col(col_map, cells, "AMOUNT")
+        declared_value = None
+        if amount_raw:
+            c = re.sub(r"[^0-9.]", "", amount_raw.replace(",", ""))
+            try:
+                declared_value = float(c) if c else None
+            except ValueError:
+                pass
+        permits.append(PermitRecord(
+            jurisdiction="Monroe County (MCPA qPublic)",
+            source_system=QPUBLIC_SOURCE,
+            permit_number=pnum,
+            permit_type=_find_col(col_map, cells, "PERMIT TYPE", "TYPE"),
+            subtype=None,
+            description=_find_col(col_map, cells, "NOTES", "DESCRIPTION"),
+            status=_find_col(col_map, cells, "STATUS"),
+            applied_date=None,
+            issued_date=_find_col(col_map, cells, "DATE ISSUED", "DATE"),
+            finaled_date=None,
+            expiration_date=None,
+            contractor_name=None,
+            contractor_license=None,
+            declared_value=declared_value,
+            inspections=[],
+            provenance=Provenance(
+                source_name=QPUBLIC_SOURCE,
+                source_url=page_url,
+                retrieved_at=now,
+                cache_path=cache_path,
+            ),
+        ))
+    return permits
+
+
+def _parse_qpublic_page(
+    html: str,
+    parcel_id: str,
+    page_url: str,
+    cache_path: str,
+) -> AppraiserRecord:
+    """
+    Parse a qPublic direct-URL property record card.
+
+    Extracts: summary fields, owners, multi-year valuation history (Historical
+    Assessments table), land, buildings, sales, and permit history.
+    All values are taken literally from the page — nothing is inferred.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # ── Summary (key-value labeled table rows) ────────────────────────────────
+    summary: dict = {}
+    for row in soup.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) == 2:
+            k = cells[0].get_text(separator=" ", strip=True).rstrip(":").upper().strip()
+            v = cells[1].get_text(separator=" ", strip=True)
+            if k and len(k) < 60 and k != v.upper():
+                summary[k] = v
+
+    parcel_out = summary.get("PARCEL ID") or parcel_id
+    account = summary.get("ACCOUNT#") or summary.get("ACCOUNT")
+    millage = summary.get("MILLAGE GROUP")
+    location = summary.get("LOCATION ADDRESS") or summary.get("LOCATION")
+    neighborhood = summary.get("NEIGHBORHOOD")
+    prop_class = summary.get("PROPERTY CLASS")
+    subdivision = summary.get("SUBDIVISION")
+    sec_twp_rng = summary.get("SEC/TWP/RNG")
+    legal = summary.get("LEGAL DESCRIPTION")
+
+    # ── Owners ────────────────────────────────────────────────────────────────
+    owner_names = _parse_qpublic_owners(soup)
+    if not owner_names:
+        raw = summary.get("OWNER NAME") or summary.get("OWNER") or ""
+        if raw:
+            owner_names = [n.strip() for n in raw.split("\n") if n.strip()]
+
+    # ── Valuation history (Historical Assessments table) ──────────────────────
+    valuation_history = _parse_qpublic_historical(soup)
+
+    # ── Land ─────────────────────────────────────────────────────────────────
+    land = _parse_qpublic_land(soup)
+    lot_sqft = land.get("lot_sqft")
+    land_use_str = land.get("land_use")
+    lot_acres = round(lot_sqft / 43560.0, 4) if lot_sqft else None
+
+    # ── Buildings ────────────────────────────────────────────────────────────
+    improvements = _parse_qpublic_buildings(soup)
+
+    # ── Sales ────────────────────────────────────────────────────────────────
+    sales_history = _parse_qpublic_sales(soup)
+
+    # ── Permits ──────────────────────────────────────────────────────────────
+    mcpa_permits = _parse_qpublic_permits(soup, page_url, cache_path)
+
+    # ── Situs address ─────────────────────────────────────────────────────────
+    situs = location or summary.get("ADDRESS") or None
+
+    logger.info(
+        "qPublic parsed: parcel=%s owners=%s val_years=%d improvements=%d sales=%d permits=%d",
+        parcel_out, owner_names, len(valuation_history), len(improvements),
+        len(sales_history), len(mcpa_permits),
+    )
+
+    return AppraiserRecord(
+        parcel_id=parcel_out or parcel_id,
+        re_number=account,
+        alternate_key=account,
+        folio=parcel_out or parcel_id,
+        owner_names=owner_names,
+        mailing_address=None,
+        situs_address=situs,
+        jurisdiction=None,  # set downstream from cadastral or city detection
+        legal_description=legal,
+        subdivision=subdivision,
+        block=None,
+        lot=None,
+        property_use_code=prop_class,
+        lot_size_sqft=float(lot_sqft) if lot_sqft else None,
+        lot_size_acres=lot_acres,
+        zoning=None,
+        land_use=land_use_str or prop_class,
+        improvements=improvements,
+        valuation_history=valuation_history,
+        sales_history=sales_history,
+        mcpa_permits=mcpa_permits,
+        provenance=Provenance(
+            source_name=QPUBLIC_SOURCE,
+            source_url=page_url,
+            retrieved_at=datetime.now(timezone.utc).isoformat(),
+            cache_path=cache_path,
+        ),
+    )
+
+
+def fetch_via_qpublic_direct(
+    parcel_id: str,
+    client: PoliteClient,
+    cache_root: Path,
+    cache_key: str,
+) -> Optional[AppraiserRecord]:
+    """
+    Navigate to the qPublic direct deep-link for parcel_id and extract the
+    full property record card, including multi-year valuation history and
+    MCPA permit history.
+
+    Uses the URL pattern:
+      https://qpublic.schneidercorp.com/Application.aspx
+        ?AppID=605&LayerID=9946&PageTypeID=4&PageID=7635&KeyValue={parcel_id}
+
+    On any block, CAPTCHA, or challenge page: stops immediately, logs, and
+    returns None. Never attempts to solve CAPTCHAs.
+    """
+    url = QPUBLIC_DIRECT_TEMPLATE.format(parcel_id=parcel_id)
+
+    # Check cache first (avoids re-hitting the site on repeated runs)
+    snap_dir = cache_root / "qpublic_direct"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    snap_path_str = str(snap_dir / f"{cache_key}.html")
+
+    cached = client.load_snapshot("qpublic_direct", cache_key)
+    if cached:
+        logger.info("Cache hit for qpublic_direct/%s", cache_key)
+        return _parse_qpublic_page(cached, parcel_id, url, snap_path_str)
+
+    try:
+        page = client.navigate(url)
+        html_pre = page.content()
+
+        # Hard stop on any Cloudflare/CAPTCHA/block signal.
+        # Policy: stop and flag; never push through.
+        lower = html_pre.lower()
+        block_signals = (
+            "just a moment",
+            "checking your browser",
+            "cloudflare",
+            "enable javascript",
+            "captcha",
+            "access denied",
+            "403 forbidden",
+            "you have been blocked",
+        )
+        if any(sig in lower for sig in block_signals):
+            logger.warning(
+                "qPublic direct URL blocked (Cloudflare/CAPTCHA) for parcel %s. "
+                "Stopping per no-CAPTCHA-solving policy. Use the manual-retrieval "
+                "link: %s", parcel_id, url
+            )
+            return None
+
+        # Accept disclaimer if present (session persistence caches this)
+        _handle_disclaimer(page)
+        client.save_domain_session("qpublic.schneidercorp.com")
+
+        html = page.content()
+        snap_path = client.save_snapshot("qpublic_direct", cache_key, html, "html")
+
+        return _parse_qpublic_page(html, parcel_id, page.url, str(snap_path))
+
+    except Exception as exc:
+        logger.error("qPublic direct fetch for parcel %s failed: %s", parcel_id, exc)
+        return None
+
+
 def _parse_money(s: Optional[str]) -> Optional[float]:
     if not s:
         return None
@@ -779,158 +1260,88 @@ def fetch(
     """
     Fetch property appraiser record for a parcel.
 
-    Navigates qPublic naturally: home → disclaimer → search tab → search → detail.
-    Returns AppraiserRecord or None on failure.
+    Two-stage approach:
+    1. FDOR Statewide Cadastral (ArcGIS REST, plain JSON, no Cloudflare):
+       resolves owner, valuation, jurisdiction, parcel centroid. Fast and reliable.
+    2. qPublic direct deep-link (Playwright, behind PoliteClient):
+       enriches with multi-year valuation history, building detail, sales history,
+       and MCPA permit history — data not available in the cadastral.
+
+    If qPublic is blocked or fails, the cadastral-only record is returned.
+    On block/CAPTCHA: stops immediately, never tries to solve it.
     """
     if cache_root is None:
         cache_root = client.cache_root
+    cache_root = Path(cache_root)
 
-    cache_key = parcel_id or address or "unknown"
+    cache_key = re.sub(r"[^\w\-]", "_", parcel_id or address or "unknown")[:80]
 
-    # ── Primary path: FDOR Statewide Cadastral over plain HTTP (no Cloudflare).
-    # Only viable when we have a parcel ID (the roll is keyed by parcel number,
-    # not address). This is tried first because it is far more reliable than the
-    # Cloudflare-protected qPublic site and needs no browser.
+    # ── Stage 1: FDOR Statewide Cadastral (primary identifier) ───────────────
+    cad_record: Optional[AppraiserRecord] = None
+
     if parcel_id:
         try:
-            cad = fetch_via_cadastral(parcel_id, Path(cache_root), cache_key)
-            if cad and cad.owner_names:
-                logger.info("Property appraiser resolved via FDOR Cadastral (by parcel).")
-                return cad
-            logger.info("Cadastral by-parcel returned nothing; trying by-address/qPublic.")
-        except Exception as exc:
-            logger.warning("Cadastral by-parcel errored (%s); trying by-address/qPublic.", exc)
-
-    # No parcel ID (or parcel lookup empty): resolve by street address via the
-    # spatial cadastral query. This lets `--mls <n> --address "..."` work end to
-    # end even when the listing is an IDX page that never exposes a parcel number.
-    if address:
-        try:
-            cad = fetch_via_cadastral_by_address(address, Path(cache_root), cache_key)
-            if cad and cad.owner_names:
-                logger.info("Property appraiser resolved via FDOR Cadastral (by address).")
-                return cad
-            logger.info("Cadastral by-address returned nothing; trying qPublic.")
-        except Exception as exc:
-            logger.warning("Cadastral by-address errored (%s); trying qPublic.", exc)
-
-    # Cache check (qPublic browser path)
-    cached_html = client.load_snapshot("qpublic", cache_key)
-    if cached_html:
-        logger.info("Cache hit for qpublic/%s", cache_key)
-        snap_path = str(cache_root / "qpublic" / f"{cache_key}.html")
-        return _parse_detail_page(cached_html, parcel_id or "", BASE_URL, snap_path)
-
-    try:
-        # Step 1: Navigate to the home page (natural entry point)
-        page = client.navigate(BASE_URL)
-
-        # Step 2: Handle disclaimer if present
-        _handle_disclaimer(page)
-        # Save session after disclaimer acceptance so next run skips it
-        domain = "qpublic.schneidercorp.com"
-        client.save_domain_session(domain)
-
-        # Step 3: Find and click parcel search tab/link
-        search_tab_texts = ["Search by Parcel", "Parcel Search", "Parcel ID", "RE Number"]
-        clicked_tab = False
-        for text in search_tab_texts:
-            try:
-                link = page.get_by_role("link", name=re.compile(text, re.IGNORECASE))
-                if link.count() > 0:
-                    client.click(link.first)
-                    page.wait_for_load_state("domcontentloaded", timeout=15000)
-                    clicked_tab = True
-                    logger.info("Clicked search tab: %s", text)
-                    break
-            except Exception:
-                pass
-
-        if not clicked_tab:
-            # Try looking for a Search nav item
-            try:
-                nav_search = page.get_by_role("link", name=re.compile(r"search", re.IGNORECASE))
-                if nav_search.count() > 0:
-                    client.click(nav_search.first)
-                    page.wait_for_load_state("domcontentloaded", timeout=15000)
-            except Exception:
-                pass
-
-        # Step 4: Find parcel input and enter the search term
-        search_value = parcel_id or address or ""
-        input_locators = [
-            page.locator("input[name*='parcel' i]"),
-            page.locator("input[id*='parcel' i]"),
-            page.locator("input[name*='re_number' i]"),
-            page.locator("input[name*='alternate' i]"),
-            page.locator("input[placeholder*='parcel' i]"),
-            page.locator("input[type='text']").first,
-        ]
-        search_input = None
-        for loc in input_locators:
-            try:
-                if loc.count() > 0:
-                    search_input = loc.first
-                    break
-            except Exception:
-                pass
-
-        if search_input is None:
-            logger.warning("Could not find parcel search input on qPublic page")
-            return None
-
-        search_input.clear()
-        client.type_text(search_input, search_value)
-
-        # Step 5: Submit
-        try:
-            submit = page.get_by_role("button", name=re.compile(r"search|submit|go", re.IGNORECASE))
-            if submit.count() > 0:
-                client.click(submit.first)
+            cad_record = fetch_via_cadastral(parcel_id, cache_root, cache_key)
+            if cad_record and cad_record.owner_names:
+                logger.info("Cadastral resolved by parcel: owner=%s", cad_record.owner_names)
             else:
-                search_input.press("Enter")
-        except Exception:
-            search_input.press("Enter")
-
-        page.wait_for_load_state("domcontentloaded", timeout=30000)
-
-        # Step 6: If multiple results, click the first matching row
-        try:
-            result_rows = page.locator("table tr a")
-            if result_rows.count() > 1:
-                client.click(result_rows.first)
-                page.wait_for_load_state("domcontentloaded", timeout=30000)
-            elif result_rows.count() == 1:
-                client.click(result_rows.first)
-                page.wait_for_load_state("domcontentloaded", timeout=30000)
+                logger.info("Cadastral by-parcel returned no data.")
         except Exception as exc:
-            logger.debug("Result click: %s", exc)
+            logger.warning("Cadastral by-parcel errored: %s", exc)
 
-        # Step 7: Save snapshot
-        html = page.content()
-        snap_path = client.save_snapshot("qpublic", cache_key, html, "html")
+    if not cad_record and address:
+        try:
+            cad_record = fetch_via_cadastral_by_address(address, cache_root, cache_key)
+            if cad_record and cad_record.owner_names:
+                logger.info("Cadastral resolved by address: owner=%s", cad_record.owner_names)
+            else:
+                logger.info("Cadastral by-address returned no data.")
+        except Exception as exc:
+            logger.warning("Cadastral by-address errored: %s", exc)
 
-        # Step 8: Try to download sketch and photo
-        record = _parse_detail_page(html, parcel_id or "", page.url, str(snap_path))
+    # Resolve actual parcel ID (supplied arg takes precedence over derived)
+    actual_parcel_id = parcel_id or (
+        cad_record and (cad_record.parcel_id or cad_record.folio)
+    )
 
-        if record.sketch_url:
-            try:
-                sketch_dest = cache_root / "qpublic" / f"{cache_key}_sketch.jpg"
-                client.download_file(record.sketch_url, sketch_dest)
-                record.sketch_cache_path = str(sketch_dest)
-            except Exception as e:
-                logger.debug("Sketch download failed: %s", e)
+    # ── Stage 2: qPublic direct deep-link (enrichment) ────────────────────────
+    # Requires a parcel ID. Adds multi-year valuations, building detail, MCPA permits.
+    qpub_record: Optional[AppraiserRecord] = None
+    if actual_parcel_id:
+        logger.info("Stage 2: qPublic direct deep-link for parcel %s", actual_parcel_id)
+        qpub_record = fetch_via_qpublic_direct(
+            actual_parcel_id, client, cache_root, cache_key
+        )
 
-        if record.photo_url:
-            try:
-                photo_dest = cache_root / "qpublic" / f"{cache_key}_photo.jpg"
-                client.download_file(record.photo_url, photo_dest)
-                record.photo_cache_path = str(photo_dest)
-            except Exception as e:
-                logger.debug("Photo download failed: %s", e)
+    # ── Merge ─────────────────────────────────────────────────────────────────
+    if qpub_record:
+        # qPublic has richer data; use it as primary with cadastral supplementing.
+        # Centroid from cadastral (has geometry; qPublic does not)
+        if cad_record and cad_record.parcel_centroid:
+            qpub_record.parcel_centroid = cad_record.parcel_centroid
+        # Jurisdiction from cadastral (city-to-permit-router) if qPublic didn't resolve
+        if not qpub_record.jurisdiction and cad_record:
+            qpub_record.jurisdiction = cad_record.jurisdiction
+        # Owner names: qPublic is authoritative if it has them; fall back to cadastral
+        if not qpub_record.owner_names and cad_record:
+            qpub_record.owner_names = cad_record.owner_names
+        # Situs address from cadastral if qPublic page omitted it
+        if not qpub_record.situs_address and cad_record:
+            qpub_record.situs_address = cad_record.situs_address
+        # If valuation history is missing from qPublic but present in cadastral, use cadastral
+        if not qpub_record.valuation_history and cad_record:
+            qpub_record.valuation_history = cad_record.valuation_history
+        logger.info(
+            "qPublic merged: val_years=%d, permits=%d, improvements=%d",
+            len(qpub_record.valuation_history),
+            len(qpub_record.mcpa_permits),
+            len(qpub_record.improvements),
+        )
+        return qpub_record
 
-        return record
+    if cad_record:
+        logger.info("qPublic direct unavailable; returning FDOR Cadastral record only.")
+        return cad_record
 
-    except Exception as exc:
-        logger.error("property_appraiser.fetch failed: %s", exc, exc_info=True)
-        return None
+    logger.warning("Both FDOR Cadastral and qPublic returned no data for this parcel/address.")
+    return None

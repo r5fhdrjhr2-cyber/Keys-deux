@@ -247,7 +247,14 @@ def run(
             })
 
         # --- Step 6: Permits via JurisdictionRouter ---
-        all_permits = []
+        # Pre-populate from qPublic MCPA if the appraiser record contained them.
+        all_permits = list(getattr(appraiser_record, "mcpa_permits", None) or [])
+        if all_permits:
+            logger.info(
+                "Pre-loaded %d permit record(s) from MCPA qPublic property record",
+                len(all_permits),
+            )
+
         permit_adapter_names = route(jurisdiction or "")
         logger.info(
             "Step 6: Running permit adapters %s for jurisdiction '%s'",

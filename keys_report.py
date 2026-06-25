@@ -156,6 +156,7 @@ def write_docx(
     _section_court_cases(doc, pr)
     _section_flood(doc, pr, listing)
     _section_sources_reached(doc, pr, verdict)
+    _section_manual_todo(doc, pr)
 
     # ── PART TWO: SYNTHESIS ───────────────────────────────────────────────────
     doc.add_heading("Part Two: Synthesis", level=1)
@@ -657,6 +658,181 @@ def _section_sources_reached(doc, pr, verdict):
         doc.add_paragraph(f"Run errors encountered: {len(errors)} source(s) failed. See JSON output for details.")
 
     doc.add_paragraph()
+
+
+_MANUAL_TODO_WORKFLOWS = {
+    "tax": {
+        "title": "Tax Collector — Bill, Payment History, Delinquency",
+        "url": "https://www.monroecounty-fl.gov/1210/Tax-Collector",
+        "steps": [
+            "Go to https://www.monroecounty-fl.gov/1210/Tax-Collector or "
+            "https://monroetaxcollector.com/",
+            "Click 'Property Tax Search' or 'Search by Real Estate Number'.",
+            "Enter the parcel/folio ID (shown on this report).",
+            "Confirm current year and prior year tax status (paid / unpaid / delinquent).",
+            "Download the current tax bill PDF; note any non-ad-valorem assessments "
+            "(sewer, stormwater, solid waste) — these are special assessments that "
+            "transfer with title.",
+            "Check for any outstanding tax certificates or tax deed proceedings.",
+        ],
+    },
+    "clerk_official": {
+        "title": "Clerk Official Records — Liens, Mortgages, Lis Pendens, Non-Conversion",
+        "url": "https://www.monroe-clerk.com/",
+        "steps": [
+            "Go to https://www.monroe-clerk.com/",
+            "Click 'Official Records' in the navigation.",
+            "Search by grantor/grantee name for each owner listed on this report.",
+            "Also search the parcel's legal description (subdivision + lot) if available.",
+            "Look specifically for: open mortgages, claims of lien, construction liens, "
+            "lis pendens, judgments, and non-conversion agreements.",
+            "Open each result and download the document image if relevant.",
+            "A non-conversion agreement (restricting STR use) will appear as an instrument "
+            "recorded against the parcel — search both current and prior owner names.",
+        ],
+    },
+    "clerk_civil": {
+        "title": "Clerk Civil / Foreclosure Docket — Active Litigation",
+        "url": "https://www.monroe-clerk.com/",
+        "steps": [
+            "Go to https://www.monroe-clerk.com/",
+            "Click 'Civil' or 'Case Search' in the navigation.",
+            "Search by party name for each owner listed on this report.",
+            "Look for: active foreclosure cases, pending judgments, or HOA actions.",
+            "Check case status — active vs. dismissed vs. closed.",
+        ],
+    },
+    "mcesearch": {
+        "title": "MCeSearch Permits — Unincorporated Monroe County (before Oct 2022)",
+        "url": "https://mcesearch.monroecounty-fl.gov/search/permits",
+        "steps": [
+            "Go to https://mcesearch.monroecounty-fl.gov/search/permits",
+            "Enter the parcel ID in the search field and submit.",
+            "Review ALL permits — note any with status 'Open', 'Expired', or 'Void'.",
+            "Open/expired permits without a final inspection indicate unfinalized work "
+            "that may be unpermitted from the buyer's standpoint.",
+            "Download the permit list and individual permit details for your records.",
+            "Applies to: unincorporated Monroe County properties only (not Key West, "
+            "Marathon, Islamorada, Key Colony Beach, or Layton).",
+        ],
+    },
+    "opal": {
+        "title": "OPAL Permits — Unincorporated Monroe County (Oct 2022 – present)",
+        "url": "https://opal.monroecounty-fl.gov/",
+        "steps": [
+            "Go to https://opal.monroecounty-fl.gov/",
+            "Search by address or parcel ID.",
+            "Review permits issued after October 2022.",
+            "Note any open or expired permits.",
+            "Applies to: unincorporated Monroe County properties only.",
+        ],
+    },
+    "key_west": {
+        "title": "Key West Permits — eTRAKiT",
+        "url": "https://www.cityofkeywest-fl.gov/",
+        "steps": [
+            "Go to the City of Key West eTRAKiT portal.",
+            "Search by address or parcel number.",
+            "Review all permit history, open permits, and expired permits.",
+        ],
+    },
+    "marathon": {
+        "title": "Marathon Permits — ViewPointCloud",
+        "url": "https://www.ci.marathon.fl.us/",
+        "steps": [
+            "Go to the City of Marathon ViewPointCloud permit portal.",
+            "Search by address.",
+            "Review all permit history and note open or expired permits.",
+        ],
+    },
+    "islamorada": {
+        "title": "Islamorada Permits — CityView",
+        "url": "https://www.islamorada.fl.us/",
+        "steps": [
+            "Go to the Village of Islamorada CityView permit portal.",
+            "Search by address or parcel number.",
+            "Review all permit history.",
+        ],
+    },
+    "key colony": {
+        "title": "Key Colony Beach Permits — Manual (no online portal)",
+        "url": "",
+        "steps": [
+            "Key Colony Beach does not have an online permit portal.",
+            "Contact the Key Colony Beach Building Department directly:",
+            "  Phone: (305) 289-1212",
+            "  Address: 600 W Ocean Dr, Key Colony Beach, FL 33051",
+            "Request the complete permit history for the property address.",
+        ],
+    },
+    "layton": {
+        "title": "Layton Permits — Manual (no online portal)",
+        "url": "",
+        "steps": [
+            "City of Layton does not have an online permit portal.",
+            "Contact the City of Layton directly:",
+            "  Phone: (305) 852-9099",
+            "  Address: 68260 Overseas Hwy, Long Key, FL 33001",
+            "Request the complete permit history for the property address.",
+        ],
+    },
+}
+
+
+def _section_manual_todo(doc, pr):
+    """
+    Write a Manual Retrieval To-Do List section for every source that could
+    not be reached this run. Each item includes the direct URL and step-by-step
+    workflow instructions for a human researcher.
+    """
+    manual = _g(pr, "manual_retrievals_required") or []
+    if not manual:
+        return
+
+    doc.add_heading("Manual Retrieval To-Do List", level=2)
+    doc.add_paragraph(
+        "The following sources could not be retrieved automatically this run. "
+        "Each item below provides direct links and step-by-step workflow instructions. "
+        "Complete every item before concluding due diligence — an unreached source is "
+        "NOT a confirmed all-clear."
+    )
+
+    for item in manual:
+        source = (_g(item, "source") or str(item)).lower()
+        source_display = _g(item, "source") or str(item)
+        reason = _g(item, "reason") or ""
+        contact_url = _g(item, "url") or _g(item, "contact") or ""
+
+        # Match to workflow template by keyword
+        workflow = None
+        for kw, wf in _MANUAL_TODO_WORKFLOWS.items():
+            if kw in source:
+                workflow = wf
+                break
+
+        # Section heading for this item
+        title = (workflow["title"] if workflow else source_display)
+        p_title = doc.add_paragraph()
+        run = p_title.add_run(title)
+        run.bold = True
+
+        # Why it matters
+        if reason:
+            doc.add_paragraph(reason[:300])
+
+        if workflow:
+            url = workflow["url"] or contact_url
+            if url:
+                doc.add_paragraph(f"URL: {url}")
+            doc.add_paragraph("Steps:")
+            for step in workflow["steps"]:
+                doc.add_paragraph(step, style="List Number")
+        else:
+            # Fallback: just show the contact info
+            if contact_url:
+                doc.add_paragraph(f"Contact / URL: {contact_url}")
+
+        doc.add_paragraph()
 
 
 # ── Part Two sections ─────────────────────────────────────────────────────────
