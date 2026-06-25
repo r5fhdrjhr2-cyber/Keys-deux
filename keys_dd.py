@@ -282,6 +282,18 @@ def _print_help():
     print()
 
 
+# ── Parcel cap reset ─────────────────────────────────────────────────────────
+
+def _reset_parcel_cap(config_path: str = DEFAULT_CONFIG):
+    config = _load_config(config_path)
+    cache_root = Path(config.get("cache", {}).get("root", "./cache")).resolve()
+    run_state_path = cache_root / "run_state.json"
+    reset = {"parcel_count": 0, "parcels": []}
+    cache_root.mkdir(parents=True, exist_ok=True)
+    run_state_path.write_text(json.dumps(reset, indent=2))
+    print(f"Parcel cap reset. Counter cleared at: {run_state_path}")
+
+
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 def _cli():
@@ -316,6 +328,8 @@ def _cli():
                         help=f"Directory for output files (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--validate", action="store_true",
                         help="Run the validation harness against known test parcels")
+    parser.add_argument("--reset-cap", action="store_true",
+                        help="Reset the per-session parcel cap counter and exit")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable DEBUG logging")
 
@@ -323,6 +337,10 @@ def _cli():
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.reset_cap:
+        _reset_parcel_cap(args.config)
+        sys.exit(0)
 
     if not args.validate and not any([args.mls, args.address, args.parcel]):
         _print_help()
