@@ -27,7 +27,8 @@ It makes no network calls except through the retrieval layer.
 
 | Source | System | Jurisdiction |
 |--------|--------|-------------|
-| Property Appraiser | qPublic AppID 605 (schneidercorp.com) | All Monroe County parcels |
+| Property Appraiser (primary) | Florida DOR Statewide Cadastral, ArcGIS REST (JSON over HTTP) | All Monroe County parcels |
+| Property Appraiser (fallback) | qPublic AppID 605 (schneidercorp.com) | All Monroe County parcels |
 | Tax Collector | monroetaxcollector.com, monroecounty-fl.gov | All Monroe County parcels |
 | Clerk -- Official Records | monroe-clerk.com | All Monroe County |
 | Clerk -- Civil Cases | monroe-clerk.com | All Monroe County |
@@ -291,9 +292,17 @@ listed in the unknowns section of every report:
   district.
 
 Monroe County Property Appraiser (mcpafl.org / qPublic) uses Cloudflare
-protection that blocks automated browser sessions. The tool degrades gracefully
-when blocked and logs the event. If you have the parcel ID from a prior run or
-manual lookup, pass it with `--parcel` to bypass the appraiser search step.
+protection that blocks automated browser sessions. Rather than fight it, the
+tool reads the same property roll (owner, just/assessed/taxable value, year
+built, living area, legal description, land use, lot size, homestead) from the
+Florida Department of Revenue Statewide Cadastral, an open ArcGIS REST service
+that answers plain JSON requests with no browser and no CAPTCHA. It resolves by
+parcel ID, or by street address via a spatial query when no parcel ID is known
+(so `--mls N --address "..."` works even for listings that never expose a tax
+number). The Cloudflare-protected qPublic site is used only as a fallback. The
+tax *collector* bill/payment/delinquency portal remains behind Cloudflare; when
+it cannot be reached the tool emits a manual-retrieval notice (the assessed and
+taxable *values* still come from the cadastral above).
 
 ---
 
