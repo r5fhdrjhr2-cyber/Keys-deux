@@ -201,18 +201,14 @@ def _d21_flood(flood: Any, appraiser: Any) -> dict:
                  {"zone": zone, "bfe": bfe, "firm_panel": firm, "pre_firm": pre_firm})
 
 
-def _d22_pre_irma(appraiser: Any, permits: list) -> dict:
+def _d22_pre_irma(appraiser: Any, permits: list, listing: dict | None = None) -> dict:
     """2.2 Pre-Irma vs post-Irma rebuild."""
     fields = [
         "appraiser.improvements[*].year_built",
         "appraiser.improvements[*].effective_year",
+        "listing.year_built (fallback)",
         "permits[permit_type~roof|structural|reconstruction, applied_date 2017-2019]",
     ]
-
-    if appraiser is None:
-        return _diag("2.2", "Pre-Irma vs post-Irma rebuild", UNKNOWN,
-                     "unknown, not in any source we pull — appraiser record not returned.",
-                     fields)
 
     improvements = _g(appraiser, "improvements") or []
     year_built = None
@@ -224,6 +220,20 @@ def _d22_pre_irma(appraiser: Any, permits: list) -> dict:
             year_built = yb
         if ey and (eff_year is None or ey > eff_year):
             eff_year = ey
+
+    year_built_source = "appraiser"
+    if year_built is None and listing:
+        year_built = _to_int(listing.get("year_built"))
+        if year_built is not None:
+            year_built_source = "listing"
+
+    # Only a true unknown if we have neither a year built nor any permit signal.
+    if appraiser is None and year_built is None and not permits:
+        return _diag("2.2", "Pre-Irma vs post-Irma rebuild", UNKNOWN,
+                     "unknown, not in any source we pull — appraiser record not "
+                     "returned and no year built in the listing. Resolve the parcel "
+                     "with the appraiser to confirm year built and storm-repair permits.",
+                     fields)
 
     irma_kw = re.compile(
         r"roof|roofing|structural|reconstruction|rebuild|repair|wind|hurricane|storm", re.I
@@ -251,17 +261,23 @@ def _d22_pre_irma(appraiser: Any, permits: list) -> dict:
     notes = []
     sev = INFO
 
+    src_tag = f" (from {year_built_source})" if year_built else ""
     if year_built:
         if year_built < 1975:
             notes.append(
-                f"Year built {year_built}: pre-1975, likely pre-FIRM and not elevated to "
-                "current code. Worst-case insurance exposure."
+                f"Year built {year_built}{src_tag}: pre-1975, likely pre-FIRM and not "
+                "elevated to current code. Worst-case insurance exposure."
             )
             sev = _max_sev(sev, YELLOW)
         else:
-            notes.append(f"Year built {year_built}.")
+            notes.append(f"Year built {year_built}{src_tag}.")
+            if year_built < IRMA_YEAR:
+                notes.append(
+                    "Structure predates Hurricane Irma (Sept 2017); check for storm-repair "
+                    "permits below."
+                )
     else:
-        notes.append("Year built: not found in appraiser record.")
+        notes.append("Year built: not found in appraiser record or listing.")
 
     if eff_year:
         if eff_year > IRMA_YEAR and year_built and year_built < 2010:
@@ -314,22 +330,20 @@ def _d22_pre_irma(appraiser: Any, permits: list) -> dict:
                   "open_irma_count": len(open_irma)})
 
 
-def _d23_str(appraiser: Any, permits: list) -> dict:
+def _d23_str(appraiser: Any, permits: list, listing: dict | None = None,
+             jurisdiction_hint: str | None = None) -> dict:
     """2.3 Short-term rental eligibility."""
     fields = [
         "appraiser.zoning", "appraiser.property_use_code", "appraiser.jurisdiction",
+        "listing.property_type / jurisdiction (fallback)",
         "permits[permit_type~vacation rental|transient|STR]",
     ]
 
-    if appraiser is None:
-        return _diag("2.3", "Short-term rental eligibility", UNKNOWN,
-                     "unknown, not in any source we pull — appraiser record not returned. "
-                     "Verify the local STR ordinance and license status directly.",
-                     fields)
-
     zoning = _g(appraiser, "zoning")
-    use_code = _g(appraiser, "property_use_code")
-    jurisdiction = _g(appraiser, "jurisdiction")
+    use_code = _g(appraiser, "property_use_code") or (
+        (listing or {}).get("property_type") if listing else None
+    )
+    jurisdiction = _g(appraiser, "jurisdiction") or jurisdiction_hint
 
     vr_kw = re.compile(r"vacation.rental|transient|vr\b|short.?term|rental.licens", re.I)
     vr_permits = [
@@ -337,13 +351,21 @@ def _d23_str(appraiser: Any, permits: list) -> dict:
         if vr_kw.search((_g(p, "permit_type") or "") + " " + (_g(p, "description") or ""))
     ]
 
+    # Genuine unknown only when we have no zoning, no use/type, and no jurisdiction.
+    if appraiser is None and not use_code and not jurisdiction and not vr_permits:
+        return _diag("2.3", "Short-term rental eligibility", UNKNOWN,
+                     "unknown, not in any source we pull — appraiser record not returned "
+                     "and listing carries no use/type or jurisdiction. Verify the local "
+                     "STR ordinance and license status directly.",
+                     fields)
+
     notes = []
     if zoning:
         notes.append(f"Zoning: {zoning}.")
     else:
         notes.append("Zoning: not in pulled records.")
     if use_code:
-        notes.append(f"Use code: {use_code}.")
+        notes.append(f"Use/type: {use_code}.")
     if jurisdiction:
         notes.append(f"Jurisdiction: {jurisdiction}.")
 
@@ -459,7 +481,8 @@ def _d25_tax_shock(appraiser: Any, tax_collector: Any) -> dict:
                   "millage": millage, "seller_tax": seller_tax})
 
 
-def _d26_distress(official_records: list, court_cases: list) -> dict:
+def _d26_distress(official_records: list, court_cases: list,
+                  searched: bool = True) -> dict:
     """2.6 Distress signals."""
     fields = ["official_records[*].tags", "court_cases[*].case_type"]
 
@@ -467,6 +490,17 @@ def _d26_distress(official_records: list, court_cases: list) -> dict:
         return _diag("2.6", "Distress signals", UNKNOWN,
                      "unknown, not in any source we pull — official records and court cases "
                      "not returned.", fields)
+
+    # Empty results are only meaningful if the search actually ran. With no owner
+    # name resolved (appraiser unreachable), an empty result is unknown, NOT a
+    # clean bill — reporting it as "none found" would be a false all-clear.
+    if not searched and not (official_records or court_cases):
+        return _diag("2.6", "Distress signals", UNKNOWN,
+                     "unknown, not in any source we pull — the name-based Clerk search "
+                     "could not run because no owner name was resolved (appraiser "
+                     "unreachable). This is NOT a confirmed absence of liens, lis "
+                     "pendens, or judgments. Resolve the owner name (via --parcel or "
+                     "manual appraiser lookup) to run this check.", fields)
 
     distress_tags = {
         "lis_pendens", "lien", "construction_lien", "claim_of_lien",
@@ -586,7 +620,7 @@ def _d27_open_permits(appraiser: Any, permits: list) -> dict:
                   "unpermitted_flags": unpermitted})
 
 
-def _d28_non_conversion(official_records: list) -> dict:
+def _d28_non_conversion(official_records: list, searched: bool = True) -> dict:
     """2.8 Recorded non-conversion agreement."""
     fields = ["official_records[tags=non_conversion_agreement]"]
 
@@ -594,6 +628,14 @@ def _d28_non_conversion(official_records: list) -> dict:
         return _diag("2.8", "Recorded non-conversion agreement", UNKNOWN,
                      "unknown, not in any source we pull — official records not returned.",
                      fields)
+
+    if not searched and not official_records:
+        return _diag("2.8", "Recorded non-conversion agreement", UNKNOWN,
+                     "unknown, not in any source we pull — the Official Records search "
+                     "could not run (no owner name resolved; appraiser unreachable). A "
+                     "non-conversion agreement restricts ground-floor space to storage "
+                     "or parking, so this gap directly affects usable square footage. "
+                     "Resolve the owner name to run this check.", fields)
 
     found = []
     for rec in official_records:
@@ -666,20 +708,21 @@ def _d29_special_assessments(tax_collector: Any) -> dict:
     return _diag("2.9", "Special assessments", sev, finding, fields, {"found": found})
 
 
-def _d210_roof_age(permits: list) -> dict:
+def _d210_roof_age(permits: list, listing: dict | None = None) -> dict:
     """2.10 Roof age from most recent finaled roofing permit."""
-    fields = ["permits[permit_type~roof, status=finaled].finaled_date"]
+    fields = [
+        "permits[permit_type~roof, status=finaled].finaled_date",
+        "listing.roof (material only)",
+    ]
 
-    if permits is None:
-        return _diag("2.10", "Roof age", UNKNOWN,
-                     "unknown, not in any source we pull — permit records not returned.",
-                     fields)
+    roof_material = (listing or {}).get("roof") if listing else None
+    material_note = f" Listing reports roof material: {roof_material}." if roof_material else ""
 
     roof_kw = re.compile(r"\broof\b|roofing|re-?roof", re.I)
     best_year = None
     best_permit = None
 
-    for p in permits:
+    for p in (permits or []):
         ptype = _g(p, "permit_type") or ""
         pdesc = _g(p, "description") or ""
         if not roof_kw.search(ptype + " " + pdesc):
@@ -694,11 +737,13 @@ def _d210_roof_age(permits: list) -> dict:
             best_permit = p
 
     if best_year is None:
-        return _diag("2.10", "Roof age", UNKNOWN,
-                     "Roof age undetermined from permits. No roofing permit with a final "
-                     "date found in pulled records. Obtain permit history from the "
-                     "jurisdiction directly or inspect the physical roof.",
-                     fields)
+        base = (
+            "Roof age undetermined from permits. No roofing permit with a final "
+            "date found in pulled records. Obtain permit history from the "
+            "jurisdiction directly or inspect the physical roof."
+        )
+        return _diag("2.10", "Roof age", UNKNOWN, base + material_note, fields,
+                     {"roof_material": roof_material})
 
     age = CURRENT_YEAR - best_year
     num = _g(best_permit, "permit_number") or "?"
@@ -721,8 +766,11 @@ def _d210_roof_age(permits: list) -> dict:
         finding += "Roof is relatively recent."
         sev = INFO
 
+    finding += material_note
+
     return _diag("2.10", "Roof age", sev, finding, fields,
-                 {"roof_year": best_year, "roof_age_years": age, "permit": str(num)})
+                 {"roof_year": best_year, "roof_age_years": age, "permit": str(num),
+                  "roof_material": roof_material})
 
 
 def _d211_market_posture(listing: dict) -> dict:
@@ -814,6 +862,7 @@ def run_diagnostics(listing: dict, parcel_record: Any, config: dict) -> list:
     if parcel_record is None:
         appraiser = tax_collector = flood = None
         official_records = court_cases = permits = []
+        jurisdiction_hint = None
     else:
         appraiser = _g(parcel_record, "appraiser")
         tax_collector = _g(parcel_record, "tax_collector")
@@ -821,18 +870,32 @@ def run_diagnostics(listing: dict, parcel_record: Any, config: dict) -> list:
         court_cases = _g(parcel_record, "court_cases") or []
         permits = _g(parcel_record, "permits") or []
         flood = _g(parcel_record, "flood")
+        jurisdiction_hint = _g(parcel_record, "jurisdiction")
+
+    # The Clerk's Official Records and civil dockets are searched by owner name.
+    # If no owner name was resolved (appraiser unreachable), that search never
+    # ran, so an empty result must read as unknown, not "none found".
+    owner_names = _g(parcel_record, "owner_names") or [] if parcel_record else []
+    clerk_searched = bool(owner_names)
+
+    # Derive a jurisdiction hint from the listing/address when the appraiser
+    # (the usual source) is unreachable, so STR routing isn't a blank.
+    if not jurisdiction_hint:
+        addr = listing.get("address") if isinstance(listing.get("address"), dict) else {}
+        city = (addr.get("city") or "").strip() if addr else ""
+        jurisdiction_hint = city or None
 
     diags = [
         _d21_flood(flood, appraiser),
-        _d22_pre_irma(appraiser, permits),
-        _d23_str(appraiser, permits),
+        _d22_pre_irma(appraiser, permits, listing),
+        _d23_str(appraiser, permits, listing, jurisdiction_hint),
         _d24_mangrove(),
         _d25_tax_shock(appraiser, tax_collector),
-        _d26_distress(official_records, court_cases),
+        _d26_distress(official_records, court_cases, clerk_searched),
         _d27_open_permits(appraiser, permits),
-        _d28_non_conversion(official_records),
+        _d28_non_conversion(official_records, clerk_searched),
         _d29_special_assessments(tax_collector),
-        _d210_roof_age(permits),
+        _d210_roof_age(permits, listing),
         _d211_market_posture(listing),
     ]
 

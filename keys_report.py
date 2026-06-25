@@ -181,10 +181,40 @@ def _section_property_snapshot(doc, listing, pr):
     imps = _g(appraiser, "improvements") or []
     main_imp = imps[0] if imps else None
 
+    # When the appraiser is unreachable, an empty appraiser field is unknown, not
+    # absent. Label it so it never reads as a confirmed blank.
+    appr_gap = "Appraiser unreachable - see Sources Reached" if appraiser is None else "N/A"
+
+    def appr(value):
+        """Appraiser-sourced value, or an honest unreachable/N/A marker."""
+        return _or(value, appr_gap)
+
+    # Parcel ID can come from the listing (tax number) even when appraiser fails.
+    listing_parcel = _g(listing, "parcel") or {}
+    parcel_id = (
+        _g(pr, "parcel_id")
+        or _g(appraiser, "parcel_id")
+        or (listing_parcel.get("parcel_id") if isinstance(listing_parcel, dict) else None)
+    )
+
+    # Subdivision: prefer appraiser, fall back to listing.
+    subdiv = (
+        " / ".join(filter(None, [
+            _g(appraiser, "subdivision"),
+            _g(appraiser, "block"),
+            _g(appraiser, "lot"),
+        ]))
+        or _g(listing, "subdivision")
+        or appr_gap
+    )
+
     rows = [
         ("List Price",
          _money(_g(listing, "list_price")) if _g(listing, "list_price") else "N/A",
          "listing"),
+        ("Parcel / Tax ID",
+         _or(parcel_id),
+         "listing / appraiser"),
         ("Beds / Baths",
          f"{_or(_g(listing,'beds'))} / {_or(_g(listing,'baths'))}",
          "listing"),
@@ -198,33 +228,38 @@ def _section_property_snapshot(doc, listing, pr):
          _or(_g(listing, "year_built") or (_g(main_imp, "year_built") if main_imp else None)),
          "appraiser / listing"),
         ("Effective Year Built",
-         _or(_g(main_imp, "effective_year") if main_imp else None),
+         appr(_g(main_imp, "effective_year") if main_imp else None),
          "appraiser"),
         ("Property Type",
          _or(_g(listing, "property_type")),
          "listing"),
+        ("Waterfront",
+         _or(_g(listing, "waterfront")),
+         "listing"),
+        ("Water / Sewer",
+         _or(_g(listing, "water_sewer")),
+         "listing"),
+        ("Roof",
+         _or(_g(listing, "roof")),
+         "listing"),
         ("Use Code",
-         _or(_g(appraiser, "property_use_code")),
+         appr(_g(appraiser, "property_use_code")),
          "appraiser"),
         ("Zoning",
-         _or(_g(appraiser, "zoning")),
+         appr(_g(appraiser, "zoning")),
          "appraiser"),
         ("Jurisdiction",
-         _or(_g(appraiser, "jurisdiction") or _g(pr, "jurisdiction")),
+         _or(_g(appraiser, "jurisdiction") or _g(pr, "jurisdiction"), appr_gap),
          "appraiser"),
         ("Owner(s)",
-         "; ".join(_g(pr, "owner_names") or []) or "N/A",
+         "; ".join(_g(pr, "owner_names") or []) or appr_gap,
          "appraiser"),
         ("Legal Description",
-         (_or(_g(appraiser, "legal_description")) or "N/A")[:120],
+         (appr(_g(appraiser, "legal_description")))[:120],
          "appraiser"),
         ("Subdivision / Block / Lot",
-         " / ".join(filter(None, [
-             _g(appraiser, "subdivision"),
-             _g(appraiser, "block"),
-             _g(appraiser, "lot"),
-         ])) or "N/A",
-         "appraiser"),
+         subdiv,
+         "appraiser / listing"),
         ("HOA Fee (monthly)",
          _money(_g(listing, "hoa_fee")) if _g(listing, "hoa_fee") else "Not published",
          "listing"),
@@ -243,7 +278,14 @@ def _section_sales_history(doc, pr):
     sales = _g(appraiser, "sales_history") or []
 
     if not sales:
-        doc.add_paragraph("No sales history returned from property appraiser.")
+        if appraiser is None:
+            doc.add_paragraph(
+                "Unknown. The property appraiser was unreachable this run, so sales "
+                "history could not be retrieved. This is not a confirmed absence of "
+                "sales. See Sources Reached."
+            )
+        else:
+            doc.add_paragraph("No sales history returned from property appraiser.")
         return
 
     hdrs = ["Date", "Price", "Grantor", "Grantee", "OR Book/Page", "Type", "Qualification"]
@@ -281,7 +323,14 @@ def _section_valuation_tax(doc, pr):
             tax_by_year[str(yr)] = ty
 
     if not val_hist and not tax_years:
-        doc.add_paragraph("No valuation or tax history returned.")
+        if appraiser is None and tax_collector is None:
+            doc.add_paragraph(
+                "Unknown. Neither the property appraiser nor the tax collector "
+                "returned data this run, so valuation and tax history could not be "
+                "retrieved. This is not a confirmed absence. See Sources Reached."
+            )
+        else:
+            doc.add_paragraph("No valuation or tax history returned.")
         return
 
     all_years = sorted(
@@ -339,13 +388,27 @@ def _section_permits(doc, pr):
     doc.add_heading("Permit History", level=2)
     permits = _g(pr, "permits") or []
     manual = _g(pr, "manual_retrievals_required") or []
+    parcel_id = _g(pr, "parcel_id")
+    jurisdiction = _g(pr, "jurisdiction")
 
-    if not permits and not manual:
-        doc.add_paragraph(
-            "No permits returned. Confirm jurisdiction routing was correct before "
-            "concluding all work is permitted."
-        )
-        return
+    if not permits:
+        if not parcel_id:
+            doc.add_paragraph(
+                "Unknown. No parcel ID was resolved, so the parcel-keyed permit "
+                "search could not run reliably (the county states parcel search is "
+                "more complete than address). This is not a confirmed absence of "
+                "permits. Supply --parcel to enable the search."
+            )
+        else:
+            doc.add_paragraph(
+                f"No permits returned for parcel {parcel_id} in jurisdiction "
+                f"'{jurisdiction or 'unknown'}'. Confirm jurisdiction routing was "
+                "correct before concluding all work is permitted."
+            )
+        # Still surface any manual-retrieval notices below.
+        if not manual:
+            doc.add_paragraph()
+            return
 
     OPEN_STATUSES = {"applied", "issued", "active", "expired"}
 
@@ -390,9 +453,22 @@ def _section_permits(doc, pr):
 def _section_official_records(doc, pr):
     doc.add_heading("Recorded Instruments (Official Records)", level=2)
     recs = _g(pr, "official_records") or []
+    owners = _g(pr, "owner_names") or []
 
     if not recs:
-        doc.add_paragraph("No official records returned from Monroe County Clerk.")
+        if not owners:
+            doc.add_paragraph(
+                "Unknown. Owner names were not resolved (the property appraiser was "
+                "unreachable), so the name-based Official Records search could not "
+                "run. This is not a confirmed absence of liens, mortgages, or "
+                "non-conversion agreements. Resolve the owner name (via --parcel or "
+                "manual appraiser lookup) to enable this search."
+            )
+        else:
+            doc.add_paragraph(
+                "No official records returned from Monroe County Clerk for the "
+                f"searched owner name(s): {', '.join(owners)}."
+            )
         return
 
     ALERT_TAGS = {
@@ -430,9 +506,21 @@ def _section_official_records(doc, pr):
 def _section_court_cases(doc, pr):
     doc.add_heading("Court and Foreclosure Cases", level=2)
     cases = _g(pr, "court_cases") or []
+    owners = _g(pr, "owner_names") or []
 
     if not cases:
-        doc.add_paragraph("No civil or foreclosure cases returned from Monroe County Clerk.")
+        if not owners:
+            doc.add_paragraph(
+                "Unknown. Owner names were not resolved (the property appraiser was "
+                "unreachable), so the name-based civil and foreclosure docket search "
+                "could not run. This is not a confirmed absence of litigation or "
+                "foreclosure. Resolve the owner name to enable this search."
+            )
+        else:
+            doc.add_paragraph(
+                "No civil or foreclosure cases returned from Monroe County Clerk for "
+                f"the searched owner name(s): {', '.join(owners)}."
+            )
         return
 
     hdrs = ["Case Number", "Type", "Filing Date", "Status", "Parties"]

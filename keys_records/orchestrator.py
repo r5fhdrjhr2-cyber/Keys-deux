@@ -129,26 +129,66 @@ def run(
                 if sale.grantor and sale.grantor not in owner_names:
                     prior_owner_names.append(sale.grantor)
 
-        resolved_parcel_id = resolved_parcel_id or mls_number or "unknown"
+        # The parcel ID is the spine for county lookups. County systems (tax,
+        # clerk, permits) do NOT index MLS numbers, so we must never substitute
+        # the MLS number as a parcel ID — doing so guarantees empty results that
+        # read as "all clear". Keep the real parcel ID only (passed in from the
+        # listing's tax number, or resolved from the appraiser). Use a separate
+        # label purely for cache/output directory naming.
+        if appraiser_record and not resolved_parcel_id:
+            resolved_parcel_id = appraiser_record.parcel_id or appraiser_record.folio
+        record_label = resolved_parcel_id or mls_number or "unknown"
         search_names = list(owner_names) + list(prior_owner_names)
+
+        if not resolved_parcel_id:
+            logger.warning(
+                "No parcel ID resolved (appraiser unreachable and none supplied). "
+                "County searches keyed on parcel ID will be skipped; provide "
+                "--parcel or a listing with a tax number to enable them."
+            )
+
+        # Appraiser unreachable is a structural gap, not a clean pass. Record it
+        # loudly so the report never reads an empty appraiser section as "all clear".
+        if appraiser_record is None:
+            manual_retrievals.append(ManualRetrievalRequiredSchema(
+                source="Monroe County Property Appraiser (qPublic AppID 605)",
+                reason=("Appraiser site did not return data (commonly Cloudflare "
+                        "bot protection). Owner names, valuation, sales, legal "
+                        "description, and improvements are therefore unknown, not "
+                        "confirmed absent. Look up the parcel manually or set "
+                        "MCPA_PARCEL_ID."),
+                contact="https://qpublic.schneidercorp.com/Application.aspx?AppID=605",
+                url="https://qpublic.schneidercorp.com/Application.aspx?AppID=605",
+            ))
 
         # --- Step 3: Tax Collector ---
         tax_record = None
-        try:
-            from .adapters.tax_collector import fetch as fetch_tax
-            logger.info("Step 3: Fetching tax collector record")
-            tax_record = fetch_tax(
-                client=client,
-                parcel_id=resolved_parcel_id,
-                cache_root=cache_root,
-            )
-        except Exception as exc:
-            logger.error("Tax collector failed: %s", exc)
-            run_errors.append({
-                "adapter": "tax_collector",
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-            })
+        if not resolved_parcel_id:
+            logger.warning("Tax Collector skipped: no parcel ID (indexed by parcel only).")
+            manual_retrievals.append(ManualRetrievalRequiredSchema(
+                source="Monroe County Tax Collector",
+                reason=("No parcel ID was resolved. The tax portal is indexed by "
+                        "parcel/account number; supply --parcel or a listing tax "
+                        "number to retrieve tax history."),
+                contact="https://monroetaxcollector.com",
+                url="https://monroetaxcollector.com",
+            ))
+        else:
+            try:
+                from .adapters.tax_collector import fetch as fetch_tax
+                logger.info("Step 3: Fetching tax collector record")
+                tax_record = fetch_tax(
+                    client=client,
+                    parcel_id=resolved_parcel_id,
+                    cache_root=cache_root,
+                )
+            except Exception as exc:
+                logger.error("Tax collector failed: %s", exc)
+                run_errors.append({
+                    "adapter": "tax_collector",
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                })
 
         # --- Step 4: Clerk Official Records ---
         official_records = []
@@ -158,7 +198,7 @@ def run(
             official_records = fetch_clerk_official(
                 client=client,
                 owner_names=search_names,
-                parcel_id=resolved_parcel_id,
+                parcel_id=resolved_parcel_id or "",
                 cache_root=cache_root,
             )
         except Exception as exc:
@@ -217,7 +257,7 @@ def run(
                 mod = importlib.import_module(f".{module_path}", package="keys_records")
                 permits = mod.fetch(
                     client=client,
-                    parcel_id=resolved_parcel_id,
+                    parcel_id=resolved_parcel_id or "",
                     address=situs_address,
                     cache_root=cache_root,
                 )
@@ -257,7 +297,7 @@ def run(
                     lon=lon,
                     year_built=year_built,
                     cache_root=cache_root,
-                    cache_key=f"flood_{resolved_parcel_id}",
+                    cache_key=f"flood_{record_label}",
                 )
             else:
                 logger.warning("Geocoding failed for address: %s", situs_address)
@@ -291,7 +331,7 @@ def run(
                     address_dict["city"] = parts[1].strip()
 
         record = ParcelRecord(
-            parcel_id=resolved_parcel_id,
+            parcel_id=resolved_parcel_id or "",
             re_number=re_number,
             address=address_dict,
             jurisdiction=jurisdiction,
@@ -308,7 +348,7 @@ def run(
         )
 
         # Write final JSON
-        parcel_dir = cache_root / resolved_parcel_id
+        parcel_dir = cache_root / record_label
         parcel_dir.mkdir(parents=True, exist_ok=True)
         output_path = parcel_dir / "record.json"
         output_path.write_text(
@@ -319,8 +359,8 @@ def run(
 
         # Update run state
         run_state["parcel_count"] += 1
-        if resolved_parcel_id not in run_state["parcels"]:
-            run_state["parcels"].append(resolved_parcel_id)
+        if record_label not in run_state["parcels"]:
+            run_state["parcels"].append(record_label)
         _save_run_state(cache_root, run_state)
 
         return record

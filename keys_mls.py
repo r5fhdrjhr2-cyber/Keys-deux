@@ -628,22 +628,81 @@ def extract_from_state(state: dict) -> dict:
 # DOM-level visible-text fallback
 # ---------------------------------------------------------------------------
 
-_PRICE_RE = re.compile(r"\$\s?([\d,]+)", re.IGNORECASE)
+# Match dollar amounts; capture trailing decimals so "$955,000.00" parses fully.
+_PRICE_RE = re.compile(r"\$\s?([\d,]+(?:\.\d{2})?)")
 _BEDS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:bed(?:room)?s?|br\b)", re.IGNORECASE)
 _BATHS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:bath(?:room)?s?|ba\b)", re.IGNORECASE)
-_SQFT_RE = re.compile(r"([\d,]+)\s*(?:sq\.?\s?ft\.?|square\s+feet)", re.IGNORECASE)
+# SQFT in either order: "972 sq ft" OR labeled "SQFT: 972" / "Living Area: 972".
+_SQFT_AFTER_RE = re.compile(r"([\d,]{2,})\s*(?:sq\.?\s?ft\.?|square\s+feet)", re.IGNORECASE)
+_SQFT_LABEL_RE = re.compile(
+    r"(?:sq\.?\s?ft\.?|sqft|square\s+feet|living\s+area)\s*[:\-]?\s*([\d,]{2,})",
+    re.IGNORECASE,
+)
 _STATUS_RE = re.compile(
     r"\b(Active|Pending|Sold|Closed|Under Contract|Back on Market|Contingent)\b",
     re.IGNORECASE,
 )
 _OFFICE_RE = re.compile(r"(?:listed by|listing office|brokerage)[\s:]+([^\n\|<]{5,60})", re.IGNORECASE)
 _AGENT_RE = re.compile(r"(?:listing agent|listed by agent|agent)[\s:]+([^\n\|<]{5,60})", re.IGNORECASE)
-_YEAR_BUILT_RE = re.compile(r"(?:year built|built in|built:)\s*(\d{4})", re.IGNORECASE)
+_YEAR_BUILT_RE = re.compile(r"(?:year built|built in|built)\s*[:\-]?\s*(\d{4})", re.IGNORECASE)
 _LOT_RE = re.compile(r"lot\s*(?:size)?[\s:]*([0-9,]+)\s*(?:sq\.?\s?ft\.?|sf\b)", re.IGNORECASE)
+_DOM_RE = re.compile(r"days?\s+on\s+market\s*[:\-]?\s*(\d+)", re.IGNORECASE)
+_SUBDIV_RE = re.compile(r"subdivision\s*[:\-]?\s*([^\n\|<]{2,50})", re.IGNORECASE)
+_PROPTYPE_RE = re.compile(r"property\s+type\s*[:\-]?\s*([^\n\|<]{3,50})", re.IGNORECASE)
+_WATERFRONT_RE = re.compile(r"waterfront(?:\s+features)?\s*[:\-]?\s*([^\n\|<]{3,40})", re.IGNORECASE)
+_WATERSEWER_RE = re.compile(r"water/?sewer\s*[:\-]?\s*([^\n\|<]{3,40})", re.IGNORECASE)
+_ROOF_RE = re.compile(r"\broof\s*[:\-]?\s*([A-Za-z][A-Za-z /]{2,30})", re.IGNORECASE)
+# Monroe County parcel / RE / tax-number formats: 00341780-000000, 1234567, etc.
+_PARCEL_RE = re.compile(
+    r"(?:tax\s*(?:number|id|account)|parcel\s*(?:id|number|#)?|re\s*(?:number|#)?|alternate\s*key|folio)"
+    r"\s*[:\-#]?\s*([0-9]{6,8}-?[0-9]{6,9}|\d{7,12})",
+    re.IGNORECASE,
+)
+
+# A Keys single-family list price floor. Anything below this is almost certainly
+# UI chrome (a mortgage-calculator default, a fee, a price-per-sqft figure), not
+# the list price. Used only to reject noise, never to fabricate a value.
+_MIN_PLAUSIBLE_PRICE = 50_000
+_MAX_PLAUSIBLE_PRICE = 100_000_000
+
+
+def _best_price(text: str) -> int | None:
+    """
+    Pick the most plausible list price from page text.
+
+    The old code grabbed the FIRST dollar amount, which on real IDX pages is a
+    mortgage-calculator default ($25,000) or a fee, not the list price. We take
+    the largest dollar amount within a plausible band instead. For a single
+    listing page this reliably selects the list price over UI chrome.
+    """
+    candidates: list[int] = []
+    for raw in _PRICE_RE.findall(text):
+        val = _int_or_none(raw.replace(",", "").split(".")[0])
+        if val is not None and _MIN_PLAUSIBLE_PRICE <= val <= _MAX_PLAUSIBLE_PRICE:
+            candidates.append(val)
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def _extract_parcel_id(text: str) -> str | None:
+    """Pull a Monroe County parcel / RE / tax number from labeled page text."""
+    m = _PARCEL_RE.search(text)
+    if m:
+        pid = m.group(1).strip()
+        # Reject obvious false positives like a bare MLS number with no separator
+        if "-" in pid or len(pid) >= 7:
+            return pid
+    return None
 
 
 def parse_dom(html: str) -> dict:
-    """Last-resort: extract key fields from visible page text."""
+    """
+    Extract key listing fields from visible page text.
+
+    Uses labeled patterns and plausibility guards rather than first-match, so UI
+    chrome (mortgage calculators, search filters) cannot poison the result.
+    """
     soup = BeautifulSoup(html, "lxml")
     # Remove nav, footer, script, style noise
     for tag in soup(["script", "style", "nav", "footer", "header"]):
@@ -652,21 +711,37 @@ def parse_dom(html: str) -> dict:
 
     result: dict = {}
 
-    m = _PRICE_RE.search(text)
-    if m:
-        result["list_price"] = _int_or_none(m.group(1).replace(",", ""))
+    price = _best_price(text)
+    if price is not None:
+        result["list_price"] = price
 
     m = _BEDS_RE.search(text)
     if m:
-        result["beds"] = _float_or_none(m.group(1))
+        beds = _float_or_none(m.group(1))
+        # 0 beds on a single-family listing is a filter-widget artifact, not data.
+        if beds:
+            result["beds"] = beds
 
     m = _BATHS_RE.search(text)
     if m:
-        result["baths"] = _float_or_none(m.group(1))
+        baths = _float_or_none(m.group(1))
+        if baths:
+            result["baths"] = baths
 
-    m = _SQFT_RE.search(text)
+    # SQFT: prefer the labeled form, fall back to the number-before-unit form,
+    # and reject implausibly small values (e.g. "79" from "Days on Market: 79").
+    sqft = None
+    m = _SQFT_LABEL_RE.search(text)
     if m:
-        result["living_area_sqft"] = _int_or_none(m.group(1).replace(",", ""))
+        sqft = _int_or_none(m.group(1).replace(",", ""))
+    if sqft is None or sqft < 200:
+        m = _SQFT_AFTER_RE.search(text)
+        if m:
+            cand = _int_or_none(m.group(1).replace(",", ""))
+            if cand and cand >= 200:
+                sqft = cand
+    if sqft and sqft >= 200:
+        result["living_area_sqft"] = sqft
 
     m = _STATUS_RE.search(text)
     if m:
@@ -675,6 +750,30 @@ def parse_dom(html: str) -> dict:
     m = _YEAR_BUILT_RE.search(text)
     if m:
         result["year_built"] = int(m.group(1))
+
+    m = _DOM_RE.search(text)
+    if m:
+        result["days_on_market"] = _int_or_none(m.group(1))
+
+    m = _PROPTYPE_RE.search(text)
+    if m:
+        result["property_type"] = m.group(1).strip()
+
+    m = _SUBDIV_RE.search(text)
+    if m:
+        result["subdivision"] = m.group(1).strip()
+
+    m = _WATERFRONT_RE.search(text)
+    if m:
+        result["waterfront"] = m.group(1).strip()
+
+    m = _WATERSEWER_RE.search(text)
+    if m:
+        result["water_sewer"] = m.group(1).strip()
+
+    m = _ROOF_RE.search(text)
+    if m:
+        result["roof"] = m.group(1).strip()
 
     m = _OFFICE_RE.search(text)
     if m:
@@ -687,6 +786,18 @@ def parse_dom(html: str) -> dict:
     m = _LOT_RE.search(text)
     if m:
         result["lot_size_sqft"] = _int_or_none(m.group(1).replace(",", ""))
+    else:
+        # Prefer the labeled "Acres: X" form; the bare "N acres" form can grab a
+        # neighboring sqft figure ("SQFT: 972 Acres"), so guard with a residential
+        # plausibility ceiling (a Keys homesite is well under 100 acres).
+        m = re.search(r"acres?\s*[:\-]?\s*([\d.]+)", text, re.IGNORECASE)
+        acres = _float_or_none(m.group(1)) if m else None
+        if acres and 0 < acres < 100:
+            result["lot_size_sqft"] = int(round(acres * 43560))
+
+    parcel_id = _extract_parcel_id(text)
+    if parcel_id:
+        result["parcel_id"] = parcel_id
 
     # Grab meta description for remarks fallback
     meta_desc = soup.find("meta", attrs={"name": "description"})
@@ -732,24 +843,40 @@ def parse_snippets(search_results: list[dict]) -> dict:
     )
     result: dict = {}
 
-    m = _PRICE_RE.search(combined)
-    if m:
-        result["list_price"] = _int_or_none(m.group(1).replace(",", ""))
+    price = _best_price(combined)
+    if price is not None:
+        result["list_price"] = price
     m = _BEDS_RE.search(combined)
     if m:
-        result["beds"] = _float_or_none(m.group(1))
+        beds = _float_or_none(m.group(1))
+        if beds:
+            result["beds"] = beds
     m = _BATHS_RE.search(combined)
     if m:
-        result["baths"] = _float_or_none(m.group(1))
-    m = _SQFT_RE.search(combined)
+        baths = _float_or_none(m.group(1))
+        if baths:
+            result["baths"] = baths
+    sqft = None
+    m = _SQFT_LABEL_RE.search(combined)
     if m:
-        result["living_area_sqft"] = _int_or_none(m.group(1).replace(",", ""))
+        sqft = _int_or_none(m.group(1).replace(",", ""))
+    if sqft is None or sqft < 200:
+        m = _SQFT_AFTER_RE.search(combined)
+        if m:
+            cand = _int_or_none(m.group(1).replace(",", ""))
+            if cand and cand >= 200:
+                sqft = cand
+    if sqft and sqft >= 200:
+        result["living_area_sqft"] = sqft
     m = _STATUS_RE.search(combined)
     if m:
         result["status"] = m.group(1).title()
     m = _OFFICE_RE.search(combined)
     if m:
         result["listing_office"] = m.group(1).strip()
+    parcel_id = _extract_parcel_id(combined)
+    if parcel_id:
+        result["parcel_id"] = parcel_id
 
     # Try to extract remarks from the richest snippet
     best = max(
@@ -1145,6 +1272,10 @@ EMPTY_RECORD: dict = {
     "listing_agent": None,
     "public_remarks": None,
     "photo_urls": [],
+    "subdivision": None,
+    "waterfront": None,
+    "water_sewer": None,
+    "roof": None,
     "parcel": {
         "parcel_id": None,
         "just_value": None,
@@ -1183,9 +1314,16 @@ def _build_record(
         "days_on_market", "beds", "baths", "living_area_sqft", "lot_size_sqft",
         "year_built", "property_type", "hoa_fee", "annual_taxes",
         "listing_office", "listing_agent", "public_remarks", "photo_urls",
+        "subdivision", "waterfront", "water_sewer", "roof",
     ]:
         if field in merged:
             rec[field] = merged[field]
+
+    # The parcel ID is the spine for all county lookups. Seed it from the
+    # listing (tax/parcel number on the page) so downstream retrieval works
+    # even when the Cloudflare-blocked appraiser never resolves it.
+    if merged.get("parcel_id"):
+        rec["parcel"]["parcel_id"] = merged["parcel_id"]
 
     if mcpa_data:
         for parcel_field in ["parcel_id", "just_value", "assessed_value",
