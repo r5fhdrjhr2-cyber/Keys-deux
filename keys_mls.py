@@ -647,11 +647,18 @@ _AGENT_RE = re.compile(r"(?:listing agent|listed by agent|agent)[\s:]+([^\n\|<]{
 _YEAR_BUILT_RE = re.compile(r"(?:year built|built in|built)\s*[:\-]?\s*(\d{4})", re.IGNORECASE)
 _LOT_RE = re.compile(r"lot\s*(?:size)?[\s:]*([0-9,]+)\s*(?:sq\.?\s?ft\.?|sf\b)", re.IGNORECASE)
 _DOM_RE = re.compile(r"days?\s+on\s+market\s*[:\-]?\s*(\d+)", re.IGNORECASE)
-_SUBDIV_RE = re.compile(r"subdivision\s*[:\-]?\s*([^\n\|<]{2,50})", re.IGNORECASE)
-_PROPTYPE_RE = re.compile(r"property\s+type\s*[:\-]?\s*([^\n\|<]{3,50})", re.IGNORECASE)
-_WATERFRONT_RE = re.compile(r"waterfront(?:\s+features)?\s*[:\-]?\s*([^\n\|<]{3,40})", re.IGNORECASE)
-_WATERSEWER_RE = re.compile(r"water/?sewer\s*[:\-]?\s*([^\n\|<]{3,40})", re.IGNORECASE)
-_ROOF_RE = re.compile(r"\broof\s*[:\-]?\s*([A-Za-z][A-Za-z /]{2,30})", re.IGNORECASE)
+# Field-value patterns. The stop class [^\n\|<;] ends at:
+#   \n  — newline (proper HTML rendered one-field-per-line)
+#   |   — pipe separator common in IDX pages
+#   <   — HTML tag boundary
+#   ;   — semicolon list terminator
+# Max lengths are intentionally short so a missing newline between adjacent
+# fields doesn't bleed the value into the next field's label text.
+_SUBDIV_RE = re.compile(r"subdivision\s*[:\-]?\s*([^\n\|<;]{2,35})", re.IGNORECASE)
+_PROPTYPE_RE = re.compile(r"property\s+type\s*[:\-]?\s*([^\n\|<;]{3,35})", re.IGNORECASE)
+_WATERFRONT_RE = re.compile(r"waterfront(?:\s+features)?\s*[:\-]?\s*([^\n\|<;]{3,30})", re.IGNORECASE)
+_WATERSEWER_RE = re.compile(r"water/?sewer\s*[:\-]?\s*([^\n\|<;]{3,30})", re.IGNORECASE)
+_ROOF_RE = re.compile(r"\broof\s*[:\-]?\s*([A-Za-z][A-Za-z /]{2,25})", re.IGNORECASE)
 # Monroe County parcel / RE / tax-number formats: 00341780-000000, 1234567, etc.
 _PARCEL_RE = re.compile(
     r"(?:tax\s*(?:number|id|account)|parcel\s*(?:id|number|#)?|re\s*(?:number|#)?|alternate\s*key|folio)"
@@ -659,30 +666,53 @@ _PARCEL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# A Keys single-family list price floor. Anything below this is almost certainly
-# UI chrome (a mortgage-calculator default, a fee, a price-per-sqft figure), not
-# the list price. Used only to reject noise, never to fabricate a value.
+# Labeled price patterns — checked before any unlabeled extraction.
+# Matches: "List Price: $955,000", "Asking Price $955,000", "Listed at $955,000".
+_PRICE_LABEL_RE = re.compile(
+    r"(?:list(?:ing)?\s+price|asking\s+price|sale\s+price|current\s+price"
+    r"|price\s+reduced(?:\s+to)?|listed\s+(?:at|for)|offered\s+at)"
+    r"\s*[:\-]?\s*\$\s*([\d,]+(?:\.\d{2})?)",
+    re.IGNORECASE,
+)
+
 _MIN_PLAUSIBLE_PRICE = 50_000
 _MAX_PLAUSIBLE_PRICE = 100_000_000
+# Ceiling for UNLABELED frequency-based extraction only. Above $5M without an
+# explicit price label we can't distinguish the list price from NFIP maximums
+# ($10M mortgage calculator cap, estate comparables, etc.). The labeled pattern
+# handles luxury properties without needing this ceiling.
+_MAX_RESIDENTIAL_FREQ = 5_000_000
 
 
 def _best_price(text: str) -> int | None:
     """
-    Pick the most plausible list price from page text.
+    Extract list price using labeled context first, frequency analysis second.
+    Never uses max() — that grabs NFIP caps or mortgage-calculator maxima.
 
-    The old code grabbed the FIRST dollar amount, which on real IDX pages is a
-    mortgage-calculator default ($25,000) or a fee, not the list price. We take
-    the largest dollar amount within a plausible band instead. For a single
-    listing page this reliably selects the list price over UI chrome.
+    Priority:
+    1. Labeled: "List Price: $955,000" → return immediately.
+    2. Frequency: the actual list price appears multiple times on a detail page
+       (title, price div, og tags, breadcrumb). Noise values appear once.
+       Count occurrences in the residential range ($50k–$5M); take most common.
     """
+    from collections import Counter
+
+    # 1. Labeled extraction (highest confidence)
+    m = _PRICE_LABEL_RE.search(text)
+    if m:
+        val = _int_or_none(m.group(1).replace(",", "").split(".")[0])
+        if val and _MIN_PLAUSIBLE_PRICE <= val <= _MAX_PLAUSIBLE_PRICE:
+            return val
+
+    # 2. Frequency analysis in residential range
     candidates: list[int] = []
     for raw in _PRICE_RE.findall(text):
         val = _int_or_none(raw.replace(",", "").split(".")[0])
-        if val is not None and _MIN_PLAUSIBLE_PRICE <= val <= _MAX_PLAUSIBLE_PRICE:
+        if val is not None and _MIN_PLAUSIBLE_PRICE <= val <= _MAX_RESIDENTIAL_FREQ:
             candidates.append(val)
     if not candidates:
         return None
-    return max(candidates)
+    return Counter(candidates).most_common(1)[0][0]
 
 
 def _extract_parcel_id(text: str) -> str | None:
@@ -711,7 +741,31 @@ def parse_dom(html: str) -> dict:
 
     result: dict = {}
 
-    price = _best_price(text)
+    # Price extraction — three-tier priority:
+    # 1. Labeled text: "List Price: $955,000" — explicit label is proof.
+    # 2. h1 heading only (not h2): on a listing page the single h1 is the price
+    #    or address. h2 is used for subheadings (NFIP limits, section headers,
+    #    comparable headings) and must not be used for price extraction.
+    # 3. Frequency via _best_price(): the actual list price repeats across title,
+    #    og tags, price div; noise values appear once.
+    labeled_price = None
+    m_lbl = _PRICE_LABEL_RE.search(text)
+    if m_lbl:
+        val = _int_or_none(m_lbl.group(1).replace(",", "").split(".")[0])
+        if val and _MIN_PLAUSIBLE_PRICE <= val <= _MAX_PLAUSIBLE_PRICE:
+            labeled_price = val
+
+    h1_price = None
+    for htag in soup.find_all("h1"):
+        htxt = htag.get_text(" ", strip=True)
+        pm = _PRICE_RE.search(htxt)
+        if pm:
+            val = _int_or_none(pm.group(1).replace(",", "").split(".")[0])
+            if val and _MIN_PLAUSIBLE_PRICE <= val <= _MAX_RESIDENTIAL_FREQ:
+                h1_price = val
+                break
+
+    price = labeled_price or h1_price or _best_price(text)
     if price is not None:
         result["list_price"] = price
 
